@@ -1,0 +1,56 @@
+    {
+      "name": "snapshot-scaling",
+      "description": "Experiment for snapshot-aware indexing-tier autoscaling (not for merge). Indexes the corpus into a single-shard index while a controller watches for the auto-reshard, changes the experiment-only snapshot floor settings according to snapshot_mode, and waits for the catch-up snapshot.",
+      "schedule": [
+        {
+          "operation": "delete-index"
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "index": "nyc_taxis",
+            "settings": {
+              "index.codec": "best_compression",
+              "index.refresh_interval": "30s"
+            }
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "nyc_taxis",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "parallel": {
+            "tasks": [
+              {
+                "operation": "index",
+                "clients": {{bulk_indexing_clients | default(8)}},
+                "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+              },
+              {
+                "name": "snapshot-scaling-controller",
+                "clients": 1,
+                "operation": {
+                  "operation-type": "snapshot-scaling-controller",
+                  "index": "nyc_taxis",
+                  "mode": "{{snapshot_mode | default('none')}}",
+                  "node-memory": "{{snapshot_floor_node_memory | default('16gb')}}",
+                  "total-memory": "{{snapshot_floor_total_memory | default('48gb')}}",
+                  "drop-after-seconds": {{snapshot_drop_after_seconds | default(60)}},
+                  "poll-interval": {{snapshot_poll_interval | default(15)}},
+                  "timeout": {{snapshot_controller_timeout | default(10800)}}
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
