@@ -172,15 +172,16 @@ async def _snapshot_oracle(es, params):
                 ev("slm_stop", response=_body(await es.perform_request(method="POST", path=path)))
             except Exception as e:
                 ev("slm_stop_failed", error=str(e)[:300])
-        if params.get("dr-probe", False):
+        names = (["dr-probe"] if params.get("dr-probe", False) else []) + ["dr-probe-%d" % i for i in range(1, int(params.get("extra-repositories", 0)) + 1)]
+        for rn in names:
             try:
                 b = _body(await es.perform_request(method="GET", path="/_snapshot/" + repo))[repo]
                 st = dict(b.get("settings", {}))
-                st["base_path"] = (st.get("base_path", "") + "-dr-probe").lstrip("-")
-                await es.perform_request(method="PUT", path="/_snapshot/dr-probe", body={"type": b["type"], "settings": st})
-                ev("dr_probe_ok", type=b["type"], keys=sorted(st.keys()))
+                st["base_path"] = (st.get("base_path", "") + "-" + rn).lstrip("-")
+                await es.perform_request(method="PUT", path="/_snapshot/" + rn, body={"type": b["type"], "settings": st})
+                ev("dr_probe_ok", repository=rn, type=b["type"], keys=sorted(st.keys()))
             except Exception as e:
-                ev("dr_probe_failed", error=str(e)[:300])
+                ev("dr_probe_failed", repository=rn, error=str(e)[:300])
         return {"weight": 1, "unit": "ops", "success": True}
 
     node_state = {"prev": None}
@@ -201,6 +202,8 @@ async def _snapshot_oracle(es, params):
             await asyncio.sleep(min(poll, max(0.0, end_ - time.time())))
 
     ev("start", mode=mode)
+    if params.get("initial-node-memory") or params.get("initial-total-memory"):
+        ev("floor_initial", settings=await _put_floor(es, params.get("initial-node-memory"), params.get("initial-total-memory"), None))
 
     # wait for ingest to go quiet
     last, since, errors = None, time.time(), 0
@@ -225,9 +228,11 @@ async def _snapshot_oracle(es, params):
 
     if mode in ("drop-nohold", "drop-hold"):
         await nap(settle)
-        ev("floor_dropped", settings=await _put_floor(es, None, None, None))
+        hold_from_drop = mode == "drop-hold" and bool(params.get("hold-from-drop", False))
+        ev("floor_dropped", settings=await _put_floor(es, None, None, True if hold_from_drop else None))
+        t_drop = time.time()
         await nap(drop_lead)
-        if mode == "drop-hold":
+        if mode == "drop-hold" and not hold_from_drop:
             ev("hold_set", settings=await _put_floor(es, None, None, True))
     elif mode == "prescale":
         before = await _index_nodes(es)
@@ -249,6 +254,7 @@ async def _snapshot_oracle(es, params):
 
     name = "oracle-" + mode + "-" + time.strftime("%H%M%S", time.gmtime())
     targets = [(repo, name)] + ([(params.get("second-repository", "dr-probe"), name + "-dr")] if mode == "dual" else [])
+    targets += [("dr-probe-%d" % i, name + "-dr%d" % i) for i in range(1, int(params.get("extra-repositories", 0)) + 1)]
     for r_, n_ in targets:
         await es.perform_request(method="PUT", path="/_snapshot/%s/%s" % (r_, n_), params={"wait_for_completion": "false"},
                                  body={"indices": index, "include_global_state": False})
@@ -287,6 +293,9 @@ async def _snapshot_oracle(es, params):
     for r_, n_ in targets[1:]:
         await _await_snapshot(es, r_, n_, deadline, poll, ev)
     if mode == "drop-hold":
+        hold_until = float(params.get("hold-until-seconds-after-drop", 0))
+        if hold_until:
+            await nap(max(0.0, t_drop + hold_until - time.time()))
         ev("hold_cleared", settings=await _put_floor(es, None, None, None))
     await nap(float(params.get("observe-after-seconds", 300)))
     try:

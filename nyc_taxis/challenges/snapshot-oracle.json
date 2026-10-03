@@ -7,7 +7,8 @@
           "operation": {
             "operation-type": "snapshot-oracle",
             "mode": "prepare",
-            "dr-probe": {{oracle_dr_probe | default(false) | tojson}}
+            "dr-probe": {{oracle_dr_probe | default(false) | tojson}},
+            "extra-repositories": {{oracle_extra_repositories | default(0)}}
           }
         },
         {
@@ -56,6 +57,11 @@
                   "settle-seconds": {{oracle_settle_seconds | default(600)}},
                   "step-after-seconds": {{oracle_step_after_seconds | default(60)}},
                   "observe-after-seconds": {{oracle_observe_after_seconds | default(300)}},
+                  "extra-repositories": {{oracle_extra_repositories | default(0)}},
+                  "hold-from-drop": {{oracle_hold_from_drop | default(false) | tojson}},
+                  "hold-until-seconds-after-drop": {{oracle_hold_until_seconds_after_drop | default(0)}},
+                  {% if oracle_initial_node_memory is defined %}"initial-node-memory": "{{oracle_initial_node_memory}}",{% endif %}
+                  {% if oracle_initial_total_memory is defined %}"initial-total-memory": "{{oracle_initial_total_memory}}",{% endif %}
                   "timeout": {{oracle_timeout | default(14400)}}
                 }
               }
