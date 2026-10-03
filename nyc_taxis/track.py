@@ -104,7 +104,7 @@ async def snapshot_scaling_controller_async(es, params):
     if mode != "none":
         ev("floor_cleared", settings=await _put_floor(es, None, None, None))
     ev("end")
-    return {"weight": 1, "unit": "ops", "success": True, "events": events}
+    return {"weight": 1, "unit": "ops", "success": True}
 
 
 # --- Experiment only: oracle runs without a split (elastic/elasticsearch-team#5291) -------------------------------
@@ -181,7 +181,7 @@ async def _snapshot_oracle(es, params):
                 ev("dr_probe_ok", type=b["type"], keys=sorted(st.keys()))
             except Exception as e:
                 ev("dr_probe_failed", error=str(e)[:300])
-        return {"weight": 1, "unit": "ops", "success": True, "events": events}
+        return {"weight": 1, "unit": "ops", "success": True}
 
     node_state = {"prev": None}
 
@@ -294,7 +294,7 @@ async def _snapshot_oracle(es, params):
     except Exception as e:
         ev("slm_start_failed", error=str(e)[:200])
     ev("end")
-    return {"weight": 1, "unit": "ops", "success": True, "events": events}
+    return {"weight": 1, "unit": "ops", "success": True}
 
 
 def register(registry):
