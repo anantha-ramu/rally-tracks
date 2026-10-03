@@ -142,6 +142,16 @@ async def _await_snapshot(es, repo, name, deadline, poll, ev):
 async def snapshot_oracle_async(es, params):
     import logging
 
+    try:
+        return await _snapshot_oracle(es, params)
+    except BaseException as e:
+        logging.getLogger(__name__).exception("snapshot-oracle {'event': 'runner_failed', 'error': %r}", repr(e)[:300])
+        raise
+
+
+async def _snapshot_oracle(es, params):
+    import logging
+
     log = logging.getLogger(__name__)
     index, mode, repo = params.get("index", "nyc_taxis"), params.get("mode", "control"), params.get("repository", "backup")
     poll = float(params.get("poll-interval", 10))
@@ -200,6 +210,7 @@ async def snapshot_oracle_async(es, params):
             errors += 1
             if errors <= 3:
                 ev("count_error", error=repr(e)[:300])
+        ev("ingest_count", docs=c, stable_s=int(time.time() - since))
         if c and c == last:
             if time.time() - since >= quiet:
                 break
