@@ -191,12 +191,15 @@ async def snapshot_oracle_async(es, params):
     ev("start", mode=mode)
 
     # wait for ingest to go quiet
-    last, since = None, time.time()
+    last, since, errors = None, time.time(), 0
     while time.time() < deadline:
         try:
-            c = _body(await es.count(index=index))["count"]
-        except Exception:
+            c = _body(await es.perform_request(method="GET", path="/%s/_count" % index))["count"]
+        except Exception as e:
             c = None
+            errors += 1
+            if errors <= 3:
+                ev("count_error", error=repr(e)[:300])
         if c and c == last:
             if time.time() - since >= quiet:
                 break
