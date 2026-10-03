@@ -117,6 +117,7 @@ async def snapshot_scaling_controller_async(es, params):
 #   drop-hold    same, but set hold_scale_down just before the snapshot and clear it after
 #   vstep        snapshot, then raise the floor step-after-seconds in (a resize in the middle of the upload)
 #   prescale     raise the floor, wait for the new nodes, then snapshot
+#   dual         snapshot to the main repository and to a second one (registered by prepare with dr-probe) at once
 async def _index_nodes(es):
     r = _body(await es.perform_request(method="GET", path="/_nodes", params={"filter_path": "nodes.*.name,nodes.*.roles,nodes.*.attributes"}))
     out = {}
@@ -124,6 +125,18 @@ async def _index_nodes(es):
         if "index" in n.get("roles", []):
             out[nid] = n.get("name", nid)
     return out
+
+
+async def _await_snapshot(es, repo, name, deadline, poll, ev):
+    while time.time() < deadline:
+        r = _body(await es.perform_request(method="GET", path="/_snapshot/%s/%s" % (repo, name)))
+        s0 = r.get("snapshots", [{}])[0]
+        if s0.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
+            ev("snapshot_done", repository=repo, state=s0.get("state"), start=s0.get("start_time_in_millis"), end=s0.get("end_time_in_millis"),
+               duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
+               shards=s0.get("shards"), failures=s0.get("failures"))
+            return
+        await asyncio.sleep(poll)
 
 
 async def snapshot_oracle_async(es, params):
@@ -216,10 +229,14 @@ async def snapshot_oracle_async(es, params):
         await asyncio.sleep(120)
 
     name = "oracle-" + mode + "-" + time.strftime("%H%M%S", time.gmtime())
-    await es.perform_request(method="PUT", path="/_snapshot/%s/%s" % (repo, name), params={"wait_for_completion": "false"},
-                             body={"indices": index, "include_global_state": False})
+    targets = [(repo, name)] + ([(params.get("second-repository", "dr-probe"), name + "-dr")] if mode == "dual" else [])
+    for r_, n_ in targets:
+        await es.perform_request(method="PUT", path="/_snapshot/%s/%s" % (r_, n_), params={"wait_for_completion": "false"},
+                                 body={"indices": index, "include_global_state": False})
+        ev("snapshot_started", repository=r_, snapshot=n_)
     t0 = time.time()
-    ev("snapshot_started", snapshot=name)
+    for r_, n_ in targets[1:]:
+        asyncio.ensure_future(_await_snapshot(es, r_, n_, deadline, poll, ev))
     stepped, shards_prev, state = False, {}, None
     while time.time() < deadline:
         if mode == "vstep" and not stepped and time.time() - t0 >= step_after:
