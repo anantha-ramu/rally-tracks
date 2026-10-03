@@ -2,6 +2,7 @@
       "name": "snapshot-fullsize",
       "description": "Experiment for snapshot-aware indexing-tier autoscaling (not for merge). Indexes the corpus several times into one single-shard index so it grows past the real auto-reshard threshold, with the usual SLM schedule, so the catch-up snapshot after the split happens as it would in production.",
       "schedule": [
+        {% if not (fullsize_keep_index | default(false)) %}
         {
           "operation": "delete-index"
         },
@@ -15,6 +16,7 @@
             }
           }
         },
+        {% endif %}
         {
           "name": "check-cluster-health",
           "operation": {
