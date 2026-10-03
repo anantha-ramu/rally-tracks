@@ -183,21 +183,23 @@ async def _snapshot_oracle(es, params):
                 ev("dr_probe_failed", error=str(e)[:300])
         return {"weight": 1, "unit": "ops", "success": True, "events": events}
 
-    stop = asyncio.Event()
+    node_state = {"prev": None}
 
-    async def watch_nodes():
-        prev = None
-        while not stop.is_set():
-            try:
-                cur = await _index_nodes(es)
-                if cur != prev:
-                    ev("index_nodes", nodes=sorted(cur.values()))
-                    prev = cur
-            except Exception as e:
-                ev("index_nodes_error", error=str(e)[:200])
-            await asyncio.sleep(poll)
+    async def tick():
+        try:
+            cur = await _index_nodes(es)
+            if cur != node_state["prev"]:
+                ev("index_nodes", nodes=sorted(cur.values()))
+                node_state["prev"] = cur
+        except Exception as e:
+            ev("index_nodes_error", error=repr(e)[:200])
 
-    watcher = asyncio.ensure_future(watch_nodes())
+    async def nap(seconds):
+        end_ = time.time() + seconds
+        while time.time() < end_:
+            await tick()
+            await asyncio.sleep(min(poll, max(0.0, end_ - time.time())))
+
     ev("start", mode=mode)
 
     # wait for ingest to go quiet
@@ -216,13 +218,13 @@ async def _snapshot_oracle(es, params):
                 break
         else:
             last, since = c, time.time()
-        await asyncio.sleep(30)
+        await nap(30)
     ev("ingest_quiet", docs=last)
 
     if mode in ("drop-nohold", "drop-hold"):
-        await asyncio.sleep(settle)
+        await nap(settle)
         ev("floor_dropped", settings=await _put_floor(es, None, None, None))
-        await asyncio.sleep(drop_lead)
+        await nap(drop_lead)
         if mode == "drop-hold":
             ev("hold_set", settings=await _put_floor(es, None, None, True))
     elif mode == "prescale":
@@ -237,10 +239,11 @@ async def _snapshot_oracle(es, params):
                 stable_since, prev = time.time(), cur
             elif time.time() - stable_since >= 60:
                 break
+            await tick()
             await asyncio.sleep(poll)
         ev("prescale_ready", nodes=sorted(prev.values()) if prev else None)
     else:
-        await asyncio.sleep(120)
+        await nap(120)
 
     name = "oracle-" + mode + "-" + time.strftime("%H%M%S", time.gmtime())
     targets = [(repo, name)] + ([(params.get("second-repository", "dr-probe"), name + "-dr")] if mode == "dual" else [])
@@ -249,8 +252,6 @@ async def _snapshot_oracle(es, params):
                                  body={"indices": index, "include_global_state": False})
         ev("snapshot_started", repository=r_, snapshot=n_)
     t0 = time.time()
-    for r_, n_ in targets[1:]:
-        asyncio.ensure_future(_await_snapshot(es, r_, n_, deadline, poll, ev))
     stepped, shards_prev, state = False, {}, None
     while time.time() < deadline:
         if mode == "vstep" and not stepped and time.time() - t0 >= step_after:
@@ -278,13 +279,14 @@ async def _snapshot_oracle(es, params):
                duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
                shards=s0.get("shards"), failures=s0.get("failures"))
             break
+        await tick()
         await asyncio.sleep(poll)
 
+    for r_, n_ in targets[1:]:
+        await _await_snapshot(es, r_, n_, deadline, poll, ev)
     if mode == "drop-hold":
         ev("hold_cleared", settings=await _put_floor(es, None, None, None))
-    await asyncio.sleep(float(params.get("observe-after-seconds", 300)))
-    stop.set()
-    await watcher
+    await nap(float(params.get("observe-after-seconds", 300)))
     try:
         ev("slm_start", response=_body(await es.perform_request(method="POST", path="/_slm/start")))
     except Exception as e:
