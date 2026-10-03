@@ -1,0 +1,66 @@
+    {
+      "name": "snapshot-oracle",
+      "description": "Experiment for snapshot-aware indexing-tier autoscaling (not for merge). Stops SLM, indexes the corpus into an index with a fixed shard count, then takes one manual snapshot of the whole index while changing the experiment-only snapshot floor settings according to oracle_mode.",
+      "schedule": [
+        {
+          "name": "snapshot-oracle-prepare",
+          "operation": {
+            "operation-type": "snapshot-oracle",
+            "mode": "prepare",
+            "dr-probe": {{oracle_dr_probe | default(false) | tojson}}
+          }
+        },
+        {
+          "operation": "delete-index"
+        },
+        {
+          "operation": {
+            "operation-type": "create-index",
+            "index": "nyc_taxis",
+            "settings": {
+              "index.codec": "best_compression",
+              "index.refresh_interval": "30s"
+            }
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "nyc_taxis",
+            "request-params": {
+              "wait_for_status": "{{cluster_health | default('green')}}",
+              "wait_for_no_relocating_shards": "true"
+            },
+            "retry-until-success": true
+          }
+        },
+        {
+          "parallel": {
+            "tasks": [
+              {
+                "operation": "index",
+                "clients": {{bulk_indexing_clients | default(8)}},
+                "ignore-response-error-level": "{{error_level | default('non-fatal')}}"
+              },
+              {
+                "name": "snapshot-oracle",
+                "clients": 1,
+                "operation": {
+                  "operation-type": "snapshot-oracle",
+                  "index": "nyc_taxis",
+                  "mode": "{{oracle_mode | default('control')}}",
+                  "step-node-memory": "{{oracle_step_node_memory | default('28gb')}}",
+                  "step-total-memory": "{{oracle_step_total_memory | default('56gb')}}",
+                  "drop-lead-seconds": {{oracle_drop_lead_seconds | default(1560)}},
+                  "settle-seconds": {{oracle_settle_seconds | default(600)}},
+                  "step-after-seconds": {{oracle_step_after_seconds | default(60)}},
+                  "observe-after-seconds": {{oracle_observe_after_seconds | default(300)}},
+                  "timeout": {{oracle_timeout | default(14400)}}
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
