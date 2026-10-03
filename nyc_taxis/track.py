@@ -218,7 +218,7 @@ async def _snapshot_oracle(es, params):
                 break
         else:
             last, since = c, time.time()
-        await nap(30)
+        await nap(float(params.get("count-interval", 30)))
     ev("ingest_quiet", docs=last)
 
     if mode in ("drop-nohold", "drop-hold"):
@@ -243,7 +243,7 @@ async def _snapshot_oracle(es, params):
             await asyncio.sleep(poll)
         ev("prescale_ready", nodes=sorted(prev.values()) if prev else None)
     else:
-        await nap(120)
+        await nap(float(params.get("pre-snapshot-seconds", 120)))
 
     name = "oracle-" + mode + "-" + time.strftime("%H%M%S", time.gmtime())
     targets = [(repo, name)] + ([(params.get("second-repository", "dr-probe"), name + "-dr")] if mode == "dual" else [])
