@@ -206,7 +206,9 @@ async def _snapshot_oracle(es, params):
     last, since, errors = None, time.time(), 0
     while time.time() < deadline:
         try:
-            c = _body(await es.perform_request(method="GET", path="/%s/_count" % index))["count"]
+            # index-tier stats; a _count would go to the search tier, which may not serve the index yet (503)
+            st_ = _body(await es.perform_request(method="GET", path="/%s/_stats/indexing" % index))
+            c = st_["_all"]["primaries"]["indexing"]["index_total"]
         except Exception as e:
             c = None
             errors += 1
