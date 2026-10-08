@@ -84,7 +84,11 @@ async def snapshot_scaling_controller_async(es, params):
 
     dropped = False
     while time.time() < deadline:
-        r = _body(await es.perform_request(method="GET", path="/_snapshot/backup/_all", params={"sort": "start_time", "order": "desc", "size": "5"}))
+        r = _body(
+            await es.perform_request(
+                method="GET", path="/_snapshot/backup/_all", params={"sort": "start_time", "order": "desc", "size": "5"}
+            )
+        )
         done = [s for s in r.get("snapshots", []) if s.get("start_time_in_millis", 0) > split_ms and s.get("state") == "SUCCESS"]
         if done:
             s = done[-1]
@@ -95,8 +99,12 @@ async def snapshot_scaling_controller_async(es, params):
             for s in cur.get("snapshots", []):
                 st = s.get("start_time_in_millis", 0)
                 if st > split_ms and time.time() * 1000 - st > drop_after * 1000:
-                    ev("floor_dropped_mid_catchup", snapshot=s.get("snapshot"), running_s=int(time.time() - st / 1000),
-                       settings=await _put_floor(es, None, None, None))
+                    ev(
+                        "floor_dropped_mid_catchup",
+                        snapshot=s.get("snapshot"),
+                        running_s=int(time.time() - st / 1000),
+                        settings=await _put_floor(es, None, None, None),
+                    )
                     dropped = True
                     break
         await asyncio.sleep(poll)
@@ -119,7 +127,9 @@ async def snapshot_scaling_controller_async(es, params):
 #   prescale     raise the floor, wait for the new nodes, then snapshot
 #   dual         snapshot to the main repository and to a second one (registered by prepare with dr-probe) at once
 async def _index_nodes(es):
-    r = _body(await es.perform_request(method="GET", path="/_nodes", params={"filter_path": "nodes.*.name,nodes.*.roles,nodes.*.attributes"}))
+    r = _body(
+        await es.perform_request(method="GET", path="/_nodes", params={"filter_path": "nodes.*.name,nodes.*.roles,nodes.*.attributes"})
+    )
     out = {}
     for nid, n in r.get("nodes", {}).items():
         if "index" in n.get("roles", []):
@@ -132,9 +142,16 @@ async def _await_snapshot(es, repo, name, deadline, poll, ev):
         r = _body(await es.perform_request(method="GET", path="/_snapshot/%s/%s" % (repo, name)))
         s0 = r.get("snapshots", [{}])[0]
         if s0.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
-            ev("snapshot_done", repository=repo, state=s0.get("state"), start=s0.get("start_time_in_millis"), end=s0.get("end_time_in_millis"),
-               duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
-               shards=s0.get("shards"), failures=s0.get("failures"))
+            ev(
+                "snapshot_done",
+                repository=repo,
+                state=s0.get("state"),
+                start=s0.get("start_time_in_millis"),
+                end=s0.get("end_time_in_millis"),
+                duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
+                shards=s0.get("shards"),
+                failures=s0.get("failures"),
+            )
             return
         await asyncio.sleep(poll)
 
@@ -172,7 +189,9 @@ async def _snapshot_oracle(es, params):
                 ev("slm_stop", response=_body(await es.perform_request(method="POST", path=path)))
             except Exception as e:
                 ev("slm_stop_failed", error=str(e)[:300])
-        names = (["dr-probe"] if params.get("dr-probe", False) else []) + ["dr-probe-%d" % i for i in range(1, int(params.get("extra-repositories", 0)) + 1)]
+        names = (["dr-probe"] if params.get("dr-probe", False) else []) + [
+            "dr-probe-%d" % i for i in range(1, int(params.get("extra-repositories", 0)) + 1)
+        ]
         for rn in names:
             try:
                 b = _body(await es.perform_request(method="GET", path="/_snapshot/" + repo))[repo]
@@ -256,8 +275,12 @@ async def _snapshot_oracle(es, params):
     targets = [(repo, name)] + ([(params.get("second-repository", "dr-probe"), name + "-dr")] if mode == "dual" else [])
     targets += [("dr-probe-%d" % i, name + "-dr%d" % i) for i in range(1, int(params.get("extra-repositories", 0)) + 1)]
     for r_, n_ in targets:
-        await es.perform_request(method="PUT", path="/_snapshot/%s/%s" % (r_, n_), params={"wait_for_completion": "false"},
-                                 body={"indices": index, "include_global_state": False})
+        await es.perform_request(
+            method="PUT",
+            path="/_snapshot/%s/%s" % (r_, n_),
+            params={"wait_for_completion": "false"},
+            body={"indices": index, "include_global_state": False},
+        )
         ev("snapshot_started", repository=r_, snapshot=n_)
     t0 = time.time()
     stepped, shards_prev, state = False, {}, None
@@ -271,8 +294,12 @@ async def _snapshot_oracle(es, params):
             state = snap.get("state")
             cur = {}
             for sid, sh in snap.get("indices", {}).get(index, {}).get("shards", {}).items():
-                cur[sid] = (sh.get("stage"), sh.get("node"), round(sh.get("stats", {}).get("processed", {}).get("size_in_bytes", 0) / 2**30, 2),
-                            round(sh.get("stats", {}).get("total", {}).get("size_in_bytes", 0) / 2**30, 2))
+                cur[sid] = (
+                    sh.get("stage"),
+                    sh.get("node"),
+                    round(sh.get("stats", {}).get("processed", {}).get("size_in_bytes", 0) / 2**30, 2),
+                    round(sh.get("stats", {}).get("total", {}).get("size_in_bytes", 0) / 2**30, 2),
+                )
             changed = {k: v for k, v in cur.items() if shards_prev.get(k, (None, None))[:2] != v[:2]}
             if changed or int(time.time() - t0) % 60 < poll:
                 ev("snapshot_status", state=state, shards=cur)
@@ -283,9 +310,15 @@ async def _snapshot_oracle(es, params):
         s0 = r.get("snapshots", [{}])[0]
         if s0.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
             state = s0.get("state")
-            ev("snapshot_done", state=state, start=s0.get("start_time_in_millis"), end=s0.get("end_time_in_millis"),
-               duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
-               shards=s0.get("shards"), failures=s0.get("failures"))
+            ev(
+                "snapshot_done",
+                state=state,
+                start=s0.get("start_time_in_millis"),
+                end=s0.get("end_time_in_millis"),
+                duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
+                shards=s0.get("shards"),
+                failures=s0.get("failures"),
+            )
             break
         await tick()
         await asyncio.sleep(poll)
@@ -306,11 +339,212 @@ async def _snapshot_oracle(es, params):
     return {"weight": 1, "unit": "ops", "success": True}
 
 
+# qos-baseline: QA baseline for snapshot network QoS (experiment only, not for merge).
+# Modes: prepare (stop SLM, wait for the index tier, restore smoke test), seed (snapshot the seed indices, then restore
+# copies so the first SLM snapshot has a catch-up of at least catchup-target-seconds), phase-b (start SLM, run the
+# policy once, restore one index under load as phase C, record every snapshot). Every step is logged as an event.
+def _shard_summary(status):
+    times, sizes = [], []
+    for idx in status.get("indices", {}).values():
+        for sh in idx.get("shards", {}).values():
+            st = sh.get("stats", {})
+            times.append(st.get("time_in_millis", 0) / 1000)
+            sizes.append(st.get("incremental", {}).get("size_in_bytes", 0))
+    times.sort()
+    pick = lambda q: round(times[min(len(times) - 1, int(q * len(times)))], 1) if times else None
+    return {
+        "shards": len(times),
+        "shard_s_p50": pick(0.5),
+        "shard_s_p90": pick(0.9),
+        "shard_s_max": pick(1.0),
+        "incremental_gib": round(sum(sizes) / 2**30, 2),
+        "per_shard_s": [round(t, 1) for t in times],
+    }
+
+
+async def qos_baseline_async(es, params):
+    import logging
+
+    try:
+        return await _qos_baseline(es, params)
+    except BaseException as e:
+        logging.getLogger(__name__).exception("qos-baseline {'event': 'runner_failed', 'error': %r}", repr(e)[:300])
+        raise
+
+
+async def _qos_baseline(es, params):
+    import logging
+    import math
+
+    log = logging.getLogger(__name__)
+    mode, repo = params.get("mode"), params.get("repository", "backup")
+    prefix, n_idx = params.get("prefix", "qos-"), int(params.get("indices", 4))
+    seeds = ["%s%d" % (prefix, i) for i in range(n_idx)]
+    poll = float(params.get("poll-interval", 10))
+    deadline = time.time() + float(params.get("timeout", 14400))
+
+    def ev(name, **kw):
+        kw.update(event=name, t=int(time.time() * 1000), ts=time.strftime("%H:%M:%S", time.gmtime()))
+        log.info("qos-baseline %s", kw)
+
+    async def req(method, path, body=None, params_=None):
+        return _body(await es.perform_request(method=method, path=path, body=body, params=params_))
+
+    async def wait_snapshot(name):
+        while time.time() < deadline:
+            s0 = (await req("GET", "/_snapshot/%s/%s" % (repo, name))).get("snapshots", [{}])[0]
+            if s0.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
+                st = await req("GET", "/_snapshot/%s/%s/_status" % (repo, name))
+                tot = st.get("snapshots", [{}])[0].get("stats", {})
+                ev(
+                    "snapshot_done",
+                    snapshot=name,
+                    state=s0.get("state"),
+                    duration_s=round((s0.get("end_time_in_millis", 0) - s0.get("start_time_in_millis", 0)) / 1000, 1),
+                    start=s0.get("start_time_in_millis"),
+                    end=s0.get("end_time_in_millis"),
+                    failures=s0.get("failures"),
+                    total_gib=round(tot.get("total", {}).get("size_in_bytes", 0) / 2**30, 2),
+                    **_shard_summary(st.get("snapshots", [{}])[0]),
+                )
+                return s0, tot
+            await asyncio.sleep(poll)
+        raise TimeoutError("snapshot %s" % name)
+
+    async def wait_green(indices):
+        while time.time() < deadline:
+            h = await req("GET", "/_cluster/health/" + indices, params_={"wait_for_status": "green", "timeout": "30s"})
+            if h.get("status") == "green":
+                return
+            await asyncio.sleep(poll)
+        raise TimeoutError("green " + indices)
+
+    async def restore(snapshot, indices, rename_to):
+        t0 = time.time()
+        ev("restore_start", snapshot=snapshot, indices=indices, rename_to=rename_to)
+        await req(
+            "POST",
+            "/_snapshot/%s/%s/_restore" % (repo, snapshot),
+            body={
+                "indices": indices,
+                "include_global_state": False,
+                "rename_pattern": "%s(.+)" % prefix,
+                "rename_replacement": rename_to + "$1",
+            },
+        )
+        await wait_green(rename_to + "*")
+        ev("restore_done", snapshot=snapshot, rename_to=rename_to, duration_s=round(time.time() - t0, 1))
+
+    async def index_nodes():
+        r = await req(
+            "GET",
+            "/_nodes/stats/os,jvm",
+            params_={"filter_path": "nodes.*.name,nodes.*.roles,nodes.*.os.mem.total_in_bytes,nodes.*.jvm.mem.heap_max_in_bytes"},
+        )
+        return sorted(
+            (
+                n["name"],
+                round(n.get("os", {}).get("mem", {}).get("total_in_bytes", 0) / 2**30, 1),
+                round(n.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0) / 2**30, 1),
+            )
+            for n in r.get("nodes", {}).values()
+            if "index" in n.get("roles", [])
+        )
+
+    ev("start", mode=mode)
+    if mode == "prepare":
+        ev("slm_stop", response=await req("POST", "/_slm/stop"))
+        ev(
+            "slm_policies",
+            policies={
+                k: {"schedule": v.get("policy", {}).get("schedule"), "repository": v.get("policy", {}).get("repository")}
+                for k, v in (await req("GET", "/_slm/policy")).items()
+            },
+        )
+        # wait until the index tier has the expected node count for stable-seconds (the floor needs a few minutes)
+        want, stable = int(params.get("expected-index-nodes", 3)), float(params.get("stable-seconds", 300))
+        prev, since = None, time.time()
+        while time.time() < deadline:
+            cur = await index_nodes()
+            if cur != prev:
+                ev("index_nodes", nodes=cur)
+                prev, since = cur, time.time()
+            if len(cur) == want and time.time() - since >= stable:
+                break
+            await asyncio.sleep(30)
+        # restore smoke test, so a refused restore fails the run in minutes rather than hours
+        smoke = prefix + "smoke"
+        for i in (smoke, smoke + "-r"):
+            await req("DELETE", "/" + i, params_={"ignore_unavailable": "true"})
+        await req("PUT", "/" + smoke)
+        await req("POST", "/%s/_doc" % smoke, body={"ok": 1}, params_={"refresh": "true"})
+        await req("PUT", "/_snapshot/%s/%s" % (repo, smoke), body={"indices": smoke, "include_global_state": False})
+        await wait_snapshot(smoke)
+        await req(
+            "POST",
+            "/_snapshot/%s/%s/_restore" % (repo, smoke),
+            body={"indices": smoke, "include_global_state": False, "rename_pattern": "(.+)", "rename_replacement": "$1-r"},
+        )
+        await wait_green(smoke + "-r")
+        ev("smoke_ok")
+        for i in (smoke, smoke + "-r"):
+            await req("DELETE", "/" + i)
+        await req("DELETE", "/_snapshot/%s/%s" % (repo, smoke))
+
+    elif mode == "seed":
+        await req("POST", "/%s/_flush" % ",".join(seeds))
+        await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
+        s0, tot = await wait_snapshot("seed")
+        seed_bytes = tot.get("total", {}).get("size_in_bytes", 0)
+        # wall time includes start-up and finalization, so this rate is low and the copy count errs long
+        rate = seed_bytes / max(1.0, tot.get("time_in_millis", 0) / 1000)
+        target = float(params.get("catchup-target-seconds", 1200))
+        copies = min(int(params.get("max-copies", 12)), max(1, math.ceil(target * rate / max(1, seed_bytes))))
+        ev(
+            "copies_planned",
+            seed_gib=round(seed_bytes / 2**30, 2),
+            rate_mib_s=round(rate / 2**20, 1),
+            copies=copies,
+            expected_catchup_s=round(copies * seed_bytes / max(1.0, rate)),
+        )
+        for k in range(1, copies + 1):
+            await restore("seed", ",".join(seeds), "%sc%d-" % (prefix, k))
+
+    elif mode == "phase-b":
+        total, warmup = float(params.get("duration-seconds", 7200)), float(params.get("warmup-seconds", 600))
+        restore_after = float(params.get("restore-after-catchup-seconds", 600))
+        t_end = time.time() + total
+        policy = params.get("policy") or next(iter(await req("GET", "/_slm/policy")))
+        await asyncio.sleep(warmup)
+        ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
+        first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
+        ev("catchup_started", snapshot=first)
+        seen, restored, catchup_end = set(), False, None
+        while time.time() < t_end:
+            cur = await req("GET", "/_snapshot/%s/_all" % repo, params_={"sort": "start_time", "order": "desc", "size": "5"})
+            for s in cur.get("snapshots", []):
+                n = s.get("snapshot")
+                if n in seen or n == "seed" or s.get("state") not in ("SUCCESS", "PARTIAL", "FAILED"):
+                    continue
+                seen.add(n)
+                await wait_snapshot(n)
+                if n == first:
+                    catchup_end = time.time()
+            if catchup_end and not restored and time.time() - catchup_end >= restore_after:
+                restored = True
+                await restore("seed", seeds[0], "%sr-" % prefix)
+            await asyncio.sleep(30)
+        ev("phase_b_done", snapshots=sorted(seen), restored=restored)
+    ev("end", mode=mode)
+    return {"weight": 1, "unit": "ops", "success": True}
+
+
 def register(registry):
     async_runner = registry.meta_data.get("async_runner", False)
     if async_runner:
         registry.register_runner("wait-for-ml-lookback", wait_for_ml_lookback_async, async_runner=True)
         registry.register_runner("snapshot-scaling-controller", snapshot_scaling_controller_async, async_runner=True)
         registry.register_runner("snapshot-oracle", snapshot_oracle_async, async_runner=True)
+        registry.register_runner("qos-baseline", qos_baseline_async, async_runner=True)
     else:
         registry.register_runner("wait-for-ml-lookback", wait_for_ml_lookback)

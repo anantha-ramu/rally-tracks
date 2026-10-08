@@ -1,0 +1,126 @@
+    {% set qos_n = qos_indices | default(4) %}
+    {% set qos_bulk = qos_bulk_size | default(5000) %}
+    {% set qos_tput = (qos_rate | default(20000)) / qos_n / qos_bulk %}
+    {
+      "name": "qos-baseline",
+      "description": "Experiment for snapshot network QoS (not for merge). Several indices at a fixed indexing rate with SLM stopped (phase A), a seed snapshot plus restored copies so the first SLM snapshot is a long catch-up, then steady indexing and search with SLM on, and one restore under load (phases B and C).",
+      "schedule": [
+        {
+          "name": "qos-prepare",
+          "operation": {
+            "operation-type": "qos-baseline",
+            "mode": "prepare",
+            "expected-index-nodes": {{qos_expected_index_nodes | default(3)}},
+            "timeout": 3600
+          }
+        },
+        {% for i in range(qos_n) %}
+        {
+          "name": "delete-qos-{{i}}",
+          "operation": {"operation-type": "delete-index", "index": "qos-{{i}}"}
+        },
+        {
+          "name": "create-qos-{{i}}",
+          "operation": {
+            "operation-type": "create-index",
+            "index": "qos-{{i}}",
+            "settings": {"index.refresh_interval": "30s"}
+          }
+        },
+        {% endfor %}
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "qos-*",
+            "request-params": {"wait_for_status": "green", "wait_for_no_relocating_shards": "true"},
+            "retry-until-success": true
+          }
+        },
+        {
+          "parallel": {
+            "tasks": [
+              {% for i in range(qos_n) %}
+              {
+                "name": "seed-qos-{{i}}",
+                "operation": {
+                  "operation-type": "bulk",
+                  "corpora": "qos-{{i}}",
+                  "indices": ["qos-{{i}}"],
+                  "bulk-size": {{qos_bulk}},
+                  "ingest-percentage": {{qos_seed_percentage | default(25)}}
+                },
+                "clients": {{qos_bulk_clients | default(2)}},
+                "target-throughput": {{qos_tput}},
+                "ignore-response-error-level": "non-fatal"
+              }{{ "," if not loop.last }}
+              {% endfor %}
+            ]
+          }
+        },
+        {
+          "name": "qos-seed",
+          "operation": {
+            "operation-type": "qos-baseline",
+            "mode": "seed",
+            "indices": {{qos_n}},
+            "catchup-target-seconds": {{qos_catchup_target_seconds | default(1200)}},
+            "max-copies": {{qos_max_copies | default(12)}},
+            "timeout": 7200
+          }
+        },
+        {
+          "parallel": {
+            "completed-by": "qos-phase-b",
+            "tasks": [
+              {
+                "name": "qos-phase-b",
+                "operation": {
+                  "operation-type": "qos-baseline",
+                  "mode": "phase-b",
+                  "indices": {{qos_n}},
+                  "duration-seconds": {{qos_phase_b_seconds | default(7200)}},
+                  "warmup-seconds": {{qos_warmup_seconds | default(600)}},
+                  "restore-after-catchup-seconds": {{qos_restore_after_catchup_seconds | default(600)}},
+                  "timeout": {{(qos_phase_b_seconds | default(7200)) + 3600}}
+                }
+              },
+              {% for i in range(qos_n) %}
+              {
+                "name": "steady-qos-{{i}}",
+                "operation": {
+                  "operation-type": "bulk",
+                  "corpora": "qos-{{i}}",
+                  "indices": ["qos-{{i}}"],
+                  "bulk-size": {{qos_bulk}},
+                  "looped": true
+                },
+                "clients": {{qos_bulk_clients | default(2)}},
+                "warmup-time-period": 0,
+                "time-period": {{(qos_phase_b_seconds | default(7200)) + 3600}},
+                "target-throughput": {{qos_tput}},
+                "ignore-response-error-level": "non-fatal"
+              },
+              {% endfor %}
+              {
+                "name": "steady-search",
+                "operation": {
+                  "operation-type": "search",
+                  "index": "{% for i in range(qos_n) %}qos-{{i}}{{ "," if not loop.last }}{% endfor %}",
+                  "body": {
+                    "size": 10,
+                    "query": {"range": {"total_amount": {"gte": 5, "lt": 15}}},
+                    "aggs": {"fare": {"avg": {"field": "fare_amount"}}}
+                  }
+                },
+                "clients": {{qos_search_clients | default(2)}},
+                "warmup-time-period": 0,
+                "time-period": {{(qos_phase_b_seconds | default(7200)) + 3600}},
+                "target-throughput": {{qos_search_rate | default(2)}},
+                "ignore-response-error-level": "non-fatal"
+              }
+            ]
+          }
+        }
+      ]
+    }

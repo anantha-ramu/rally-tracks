@@ -27,7 +27,11 @@
     {
       "name": "nyc_vendors",
       "body": "index-vendors.json"
-    }
+    }{% for i in range(qos_indices | default(0)) %},
+    {
+      "name": "qos-{{i}}",
+      "body": "index.json"
+    }{% endfor %}
   ],
   "corpora": [
     {
@@ -99,7 +103,20 @@
           "uncompressed-bytes": 67
         }
       ]
-    }
+    }{% for i in range(qos_indices | default(0)) %},
+    {
+      "name": "qos-{{i}}",
+      "base-url": "https://rally-tracks.elastic.co/nyc_taxis",
+      "documents": [
+        {
+          "target-index": "qos-{{i}}",
+          "source-file": "documents.json.bz2",
+          "document-count": 165346692,
+          "compressed-bytes": 4820107188,
+          "uncompressed-bytes": 79802445255
+        }
+      ]
+    }{% endfor %}
   ],
   "operations": [
     {{ rally.collect(parts="operations/*.json") }}
