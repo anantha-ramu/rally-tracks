@@ -3,7 +3,7 @@
     {% set qos_tput = (qos_rate | default(20000)) / qos_n / qos_bulk %}
     {
       "name": "qos-baseline",
-      "description": "Experiment for snapshot network QoS (not for merge). Several indices at a fixed indexing rate with SLM stopped (phase A), a seed snapshot plus restored copies so the first SLM snapshot is a long catch-up, then steady indexing and search with SLM on, and one restore under load (phases B and C).",
+      "description": "Experiment for snapshot network QoS (not for merge). Several indices at a fixed indexing rate with SLM stopped (phase A), a seed snapshot with no load, then steady indexing and search (phase B) during which restored copies of the seed (phase C) build the backlog for the first SLM snapshot, the catch-up.",
       "schedule": [
         {
           "name": "qos-prepare",
@@ -81,7 +81,8 @@
                   "indices": {{qos_n}},
                   "duration-seconds": {{qos_phase_b_seconds | default(7200)}},
                   "warmup-seconds": {{qos_warmup_seconds | default(600)}},
-                  "restore-after-catchup-seconds": {{qos_restore_after_catchup_seconds | default(600)}},
+                  "catchup-target-seconds": {{qos_catchup_target_seconds | default(1200)}},
+                  "max-copies": {{qos_max_copies | default(12)}},
                   "timeout": {{(qos_phase_b_seconds | default(7200)) + 3600}}
                 }
               },

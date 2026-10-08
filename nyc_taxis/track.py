@@ -421,19 +421,42 @@ async def _qos_baseline(es, params):
 
     async def restore(snapshot, indices, rename_to):
         t0 = time.time()
-        ev("restore_start", snapshot=snapshot, indices=indices, rename_to=rename_to)
-        await req(
-            "POST",
-            "/_snapshot/%s/%s/_restore" % (repo, snapshot),
-            body={
-                "indices": indices,
-                "include_global_state": False,
-                "rename_pattern": "%s(.+)" % prefix,
-                "rename_replacement": rename_to + "$1",
-            },
-        )
+        body = {
+            "indices": indices,
+            "include_global_state": False,
+            "rename_pattern": "%s(.+)" % prefix,
+            "rename_replacement": rename_to + "$1",
+            "index_settings": {"index.number_of_replicas": 0},
+        }
+        try:
+            await req("POST", "/_snapshot/%s/%s/_restore" % (repo, snapshot), body=body)
+            replicas = 0
+        except Exception as e:
+            # keep replicas if the operator user may not change them; noted in the results
+            ev("restore_replicas0_refused", error=repr(e)[:300])
+            del body["index_settings"]
+            await req("POST", "/_snapshot/%s/%s/_restore" % (repo, snapshot), body=body)
+            replicas = None
+        ev("restore_start", snapshot=snapshot, indices=indices, rename_to=rename_to, replicas=replicas)
         await wait_green(rename_to + "*")
         ev("restore_done", snapshot=snapshot, rename_to=rename_to, duration_s=round(time.time() - t0, 1))
+
+    async def plan_copies():
+        # the seed snapshot runs with no foreground load: its rate is the arm's clean rate. Wall time includes
+        # start-up and finalization, so the rate is low and the copy count errs long.
+        st = (await req("GET", "/_snapshot/%s/seed/_status" % repo)).get("snapshots", [{}])[0].get("stats", {})
+        seed_bytes = st.get("total", {}).get("size_in_bytes", 0)
+        rate = seed_bytes / max(1.0, st.get("time_in_millis", 0) / 1000)
+        target = float(params.get("catchup-target-seconds", 1200))
+        copies = min(int(params.get("max-copies", 12)), max(1, math.ceil(target * rate / max(1, seed_bytes))))
+        ev(
+            "copies_planned",
+            seed_gib=round(seed_bytes / 2**30, 2),
+            clean_rate_mib_s=round(rate / 2**20, 1),
+            copies=copies,
+            expected_catchup_s=round(copies * seed_bytes / max(1.0, rate)),
+        )
+        return copies
 
     async def index_nodes():
         r = await req(
@@ -474,52 +497,40 @@ async def _qos_baseline(es, params):
             await asyncio.sleep(30)
         # restore smoke test, so a refused restore fails the run in minutes rather than hours
         smoke = prefix + "smoke"
-        for i in (smoke, smoke + "-r"):
+        for i in (smoke, prefix + "r0-smoke"):
             await req("DELETE", "/" + i, params_={"ignore_unavailable": "true"})
         await req("PUT", "/" + smoke)
         await req("POST", "/%s/_doc" % smoke, body={"ok": 1}, params_={"refresh": "true"})
         await req("PUT", "/_snapshot/%s/%s" % (repo, smoke), body={"indices": smoke, "include_global_state": False})
         await wait_snapshot(smoke)
-        await req(
-            "POST",
-            "/_snapshot/%s/%s/_restore" % (repo, smoke),
-            body={"indices": smoke, "include_global_state": False, "rename_pattern": "(.+)", "rename_replacement": "$1-r"},
-        )
-        await wait_green(smoke + "-r")
+        await restore(smoke, smoke, prefix + "r0-")
         ev("smoke_ok")
-        for i in (smoke, smoke + "-r"):
+        for i in (smoke, prefix + "r0-smoke"):
             await req("DELETE", "/" + i)
         await req("DELETE", "/_snapshot/%s/%s" % (repo, smoke))
 
     elif mode == "seed":
         await req("POST", "/%s/_flush" % ",".join(seeds))
         await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
-        s0, tot = await wait_snapshot("seed")
-        seed_bytes = tot.get("total", {}).get("size_in_bytes", 0)
-        # wall time includes start-up and finalization, so this rate is low and the copy count errs long
-        rate = seed_bytes / max(1.0, tot.get("time_in_millis", 0) / 1000)
-        target = float(params.get("catchup-target-seconds", 1200))
-        copies = min(int(params.get("max-copies", 12)), max(1, math.ceil(target * rate / max(1, seed_bytes))))
-        ev(
-            "copies_planned",
-            seed_gib=round(seed_bytes / 2**30, 2),
-            rate_mib_s=round(rate / 2**20, 1),
-            copies=copies,
-            expected_catchup_s=round(copies * seed_bytes / max(1.0, rate)),
-        )
-        for k in range(1, copies + 1):
-            await restore("seed", ",".join(seeds), "%sc%d-" % (prefix, k))
+        await wait_snapshot("seed")
+        await plan_copies()
 
     elif mode == "phase-b":
+        # warm-up under steady load, then phase C: restore K copies of the seed (the backlog), then start SLM and
+        # run the policy once (the catch-up), then record every snapshot until the end
         total, warmup = float(params.get("duration-seconds", 7200)), float(params.get("warmup-seconds", 600))
-        restore_after = float(params.get("restore-after-catchup-seconds", 600))
         t_end = time.time() + total
         policy = params.get("policy") or next(iter(await req("GET", "/_slm/policy")))
         await asyncio.sleep(warmup)
+        copies, t0 = await plan_copies(), time.time()
+        ev("phase_c_start", copies=copies)
+        for k in range(1, copies + 1):
+            await restore("seed", ",".join(seeds), "%sc%d-" % (prefix, k))
+        ev("phase_c_done", copies=copies, duration_s=round(time.time() - t0, 1))
         ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
         first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
         ev("catchup_started", snapshot=first)
-        seen, restored, catchup_end = set(), False, None
+        seen = set()
         while time.time() < t_end:
             cur = await req("GET", "/_snapshot/%s/_all" % repo, params_={"sort": "start_time", "order": "desc", "size": "5"})
             for s in cur.get("snapshots", []):
@@ -528,13 +539,8 @@ async def _qos_baseline(es, params):
                     continue
                 seen.add(n)
                 await wait_snapshot(n)
-                if n == first:
-                    catchup_end = time.time()
-            if catchup_end and not restored and time.time() - catchup_end >= restore_after:
-                restored = True
-                await restore("seed", seeds[0], "%sr-" % prefix)
             await asyncio.sleep(30)
-        ev("phase_b_done", snapshots=sorted(seen), restored=restored)
+        ev("phase_b_done", snapshots=sorted(seen), catchup=first)
     ev("end", mode=mode)
     return {"weight": 1, "unit": "ops", "success": True}
 
