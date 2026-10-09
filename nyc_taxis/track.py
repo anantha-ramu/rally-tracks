@@ -484,6 +484,17 @@ async def _qos_baseline(es, params):
     ev("start", mode=mode)
     if mode == "prepare":
         ev("slm_stop", response=await req("POST", "/_slm/stop"))
+        # a rerun starts clean: drop copies and restores left by an earlier attempt, and the seed snapshot
+        left = await req("GET", "/_cat/indices/%s*" % prefix, params_={"format": "json", "h": "index"})
+        stale = [i["index"] for i in left if i["index"] not in seeds]
+        for i in stale:
+            await req("DELETE", "/" + i)
+        try:
+            await req("DELETE", "/_snapshot/%s/seed" % repo)
+            stale.append("snapshot seed")
+        except Exception:
+            pass
+        ev("cleanup", removed=stale)
         ev(
             "slm_policies",
             policies={
