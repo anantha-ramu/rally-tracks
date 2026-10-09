@@ -45,7 +45,7 @@
                 "name": "seed-qos-{{i}}",
                 "operation": {
                   "operation-type": "bulk",
-                  "corpora": "qos-{{i}}",
+                  "corpora": "qos",
                   "indices": ["qos-{{i}}"],
                   "bulk-size": {{qos_bulk}},
                   "ingest-percentage": {{qos_seed_percentage | default(25)}}
@@ -91,7 +91,7 @@
                 "name": "steady-qos-{{i}}",
                 "operation": {
                   "operation-type": "bulk",
-                  "corpora": "qos-{{i}}",
+                  "corpora": "qos",
                   "indices": ["qos-{{i}}"],
                   "bulk-size": {{qos_bulk}},
                   "looped": true

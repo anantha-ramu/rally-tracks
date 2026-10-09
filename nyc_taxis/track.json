@@ -103,20 +103,21 @@
           "uncompressed-bytes": 67
         }
       ]
-    }{% for i in range(qos_indices | default(0)) %},
+    }{% if (qos_indices | default(0)) > 0 %},
     {
-      "name": "qos-{{i}}",
+      "#COMMENT": "One corpus for all qos indices, so the source file is downloaded and decompressed once",
+      "name": "qos",
       "base-url": "https://rally-tracks.elastic.co/nyc_taxis",
-      "documents": [
+      "documents": [{% for i in range(qos_indices) %}
         {
           "target-index": "qos-{{i}}",
           "source-file": "documents.json.bz2",
           "document-count": 165346692,
           "compressed-bytes": 4820107188,
           "uncompressed-bytes": 79802445255
-        }
+        }{{ "," if not loop.last }}{% endfor %}
       ]
-    }{% endfor %}
+    }{% endif %}
   ],
   "operations": [
     {{ rally.collect(parts="operations/*.json") }}
