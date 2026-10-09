@@ -510,6 +510,26 @@ async def _qos_baseline(es, params):
         await req("DELETE", "/_snapshot/%s/%s" % (repo, smoke))
 
     elif mode == "seed":
+        # the seed snapshot gives the arm's clean rate, so it must run on the target shape: wait until the index tier
+        # has the expected node count, all the same size, for a while; give up after gate-seconds (relaunch the arm)
+        want, stable, gate_end = (
+            int(params.get("expected-index-nodes", 3)),
+            float(params.get("stable-seconds", 120)),
+            time.time() + float(params.get("gate-seconds", 2700)),
+        )
+        prev, since = None, time.time()
+        while True:
+            cur = await index_nodes()
+            if cur != prev:
+                ev("index_nodes", nodes=cur)
+                prev, since = cur, time.time()
+            if len(cur) == want and len({n[1] for n in cur}) == 1 and time.time() - since >= stable:
+                ev("seed_gate_open", nodes=cur)
+                break
+            if time.time() > gate_end:
+                ev("seed_gate_timeout", nodes=cur)
+                raise RuntimeError("index tier not on its target shape: %s" % (cur,))
+            await asyncio.sleep(30)
         await req("POST", "/%s/_flush" % ",".join(seeds))
         await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
         await wait_snapshot("seed")

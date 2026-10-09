@@ -64,9 +64,10 @@
             "operation-type": "qos-baseline",
             "mode": "seed",
             "indices": {{qos_n}},
+            "expected-index-nodes": {{qos_expected_index_nodes | default(3)}},
             "catchup-target-seconds": {{qos_catchup_target_seconds | default(1200)}},
             "max-copies": {{qos_max_copies | default(12)}},
-            "timeout": 7200
+            "timeout": 10800
           }
         },
         {
