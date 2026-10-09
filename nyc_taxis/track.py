@@ -412,10 +412,17 @@ async def _qos_baseline(es, params):
         raise TimeoutError("snapshot %s" % name)
 
     async def wait_green(indices):
+        errors = 0
         while time.time() < deadline:
-            h = await req("GET", "/_cluster/health/" + indices, params_={"wait_for_status": "green", "timeout": "30s"})
-            if h.get("status") == "green":
-                return
+            try:
+                h = await req("GET", "/_cluster/health/" + indices, params_={"wait_for_status": "green", "timeout": "20s"})
+                if h.get("status") == "green":
+                    return
+            except Exception as e:
+                # a slow or busy endpoint must not end the run; keep polling until the deadline
+                errors += 1
+                if errors <= 3 or errors % 20 == 0:
+                    ev("health_error", indices=indices, errors=errors, error=repr(e)[:200])
             await asyncio.sleep(poll)
         raise TimeoutError("green " + indices)
 
@@ -433,7 +440,7 @@ async def _qos_baseline(es, params):
             replicas = 0
         except Exception as e:
             # keep replicas if the operator user may not change them; noted in the results
-            ev("restore_replicas0_refused", error=repr(e)[:300])
+            ev("restore_replicas0_refused", error=str(getattr(e, "body", "") or repr(e))[:500])
             del body["index_settings"]
             await req("POST", "/_snapshot/%s/%s/_restore" % (repo, snapshot), body=body)
             replicas = None
@@ -531,8 +538,16 @@ async def _qos_baseline(es, params):
                 raise RuntimeError("index tier not on its target shape: %s" % (cur,))
             await asyncio.sleep(30)
         await req("POST", "/%s/_flush" % ",".join(seeds))
-        await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
-        await wait_snapshot("seed")
+        for attempt in range(1, int(params.get("seed-attempts", 3)) + 1):
+            await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
+            s0, _ = await wait_snapshot("seed")
+            if s0.get("state") == "SUCCESS":
+                break
+            # copies are restored from the seed, so it must be complete; the failed attempt stays in the log
+            ev("seed_retry", attempt=attempt, state=s0.get("state"))
+            await req("DELETE", "/_snapshot/%s/seed" % repo)
+        else:
+            raise RuntimeError("seed snapshot not SUCCESS after retries")
         await plan_copies()
 
     elif mode == "phase-b":

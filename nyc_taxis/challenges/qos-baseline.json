@@ -24,7 +24,7 @@
           "operation": {
             "operation-type": "create-index",
             "index": "qos-{{i}}",
-            "settings": {"index.refresh_interval": "30s"}
+            "settings": {"index.refresh_interval": "30s", "index.number_of_replicas": 1}
           }
         },
         {% endfor %}
