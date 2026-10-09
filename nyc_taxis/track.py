@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import time
 
 
@@ -459,6 +461,61 @@ async def _qos_baseline(es, params):
         await wait_green(rename_to + "*")
         ev("restore_done", snapshot=snapshot, rename_to=rename_to, duration_s=round(time.time() - t0, 1))
 
+    SWITCH_KEYS = ("background_qos.enabled", "adaptive_upload_concurrency.enabled", "backlog_tracking.enabled")
+
+    async def cluster_settings():
+        r = await req("GET", "/_cluster/settings", params_={"flat_settings": "true", "filter_path": "persistent.*,transient.*"})
+        return {
+            k: v
+            for tier in ("persistent", "transient")
+            for k, v in (r.get(tier) or {}).items()
+            if not k.startswith("serverless.autoscaling")
+        }
+
+    def switches_on(settings):
+        return {k: v for k, v in settings.items() if any(k.endswith(x) for x in SWITCH_KEYS) and str(v).lower() == "true"}
+
+    def invalid(reason, **kw):
+        # a validity gate failed: the arm's data must not be compared. Stop the run, loudly.
+        ev("arm_invalid", reason=reason, **kw)
+        raise RuntimeError("arm invalid: %s %s" % (reason, kw))
+
+    async def apply_arm_settings():
+        want = params.get("apply-settings") or {}
+        if not want:
+            ev("settings_applied", applied={}, state=await cluster_settings())
+            return
+        await req("PUT", "/_cluster/settings", body={"persistent": want})
+        state = await cluster_settings()
+        missing = {k: v for k, v in want.items() if str(state.get(k)).lower() != str(v).lower()}
+        ev("settings_applied", applied=want, state=state, missing=missing)
+        if missing:
+            invalid("settings_not_in_effect", missing=missing)
+
+    async def write_shard_map(label):
+        # which node holds each primary, so snapshot status per shard can be mapped to the node whose tracker reported it
+        rows = await req("GET", "/_cat/shards", params_={"format": "json", "h": "index,shard,prirep,state,node,store"})
+        path = os.path.expanduser("~/qos-shardmap-%s-%d.json" % (label, int(time.time())))
+        with open(path, "w") as f:
+            json.dump([r for r in rows if r.get("prirep") == "p"], f)
+        ev("shard_map", path=path, primaries=sum(1 for r in rows if r.get("prirep") == "p"))
+
+    async def throughput_probe(state):
+        # achieved indexing over the live indices (primaries) since the last probe; the caller decides what to do with it
+        try:
+            st = await req("GET", "/%s/_stats/indexing" % ",".join(seeds))
+            n, now = st["_all"]["primaries"]["indexing"]["index_total"], time.time()
+        except Exception:
+            return None
+        last = state.get("last")
+        state["last"] = (n, now)
+        if not last or now - last[1] < 5:
+            return None
+        rate = (n - last[0]) / (now - last[1])
+        target = float(params.get("target-docs-per-s", 0))
+        ev("throughput_probe", docs_per_s=round(rate), pct_of_target=round(100 * rate / target, 1) if target else None)
+        return rate
+
     async def plan_copies():
         # the seed snapshot runs with no foreground load: its rate is the arm's clean rate. Wall time includes
         # start-up and finalization, so the rate is low and the copy count errs long.
@@ -467,8 +524,13 @@ async def _qos_baseline(es, params):
         rate = seed_bytes / max(1.0, st.get("time_in_millis", 0) / 1000)
         target = float(params.get("catchup-target-seconds", 1200))
         copies = min(int(params.get("max-copies", 12)), max(1, math.ceil(target * rate / max(1, seed_bytes))))
+        fixed = int(params.get("fixed-copies", 0))
+        if fixed:
+            # iteration 3: the same K for every arm of a size, whatever the arm's own seed rate was
+            copies = fixed
         ev(
             "copies_planned",
+            fixed=bool(fixed),
             seed_gib=round(seed_bytes / 2**30, 2),
             clean_rate_mib_s=round(rate / 2**20, 1),
             copies=copies,
@@ -559,14 +621,22 @@ async def _qos_baseline(es, params):
                 ev("seed_gate_timeout", nodes=cur)
                 raise RuntimeError("index tier not on its target shape: %s" % (cur,))
             await asyncio.sleep(30)
+        state = await cluster_settings()
+        ev("settings_state", phase="seed", state=state)
+        if params.get("strict", False) and switches_on(state):
+            invalid("switches_on_at_seed", switches=switches_on(state))
         await req("POST", "/%s/_flush" % ",".join(seeds))
-        for attempt in range(1, int(params.get("seed-attempts", 3)) + 1):
+        attempts = 1 if params.get("strict", False) else int(params.get("seed-attempts", 3))
+        for attempt in range(1, attempts + 1):
             await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
             s0, _ = await wait_snapshot("seed")
             if s0.get("state") == "SUCCESS":
                 break
             # copies are restored from the seed, so it must be complete; the failed attempt stays in the log
             ev("seed_retry", attempt=attempt, state=s0.get("state"))
+            if params.get("strict", False):
+                # iteration 3: a retried or PARTIAL seed makes the arm incomparable, so stop instead of retrying
+                invalid("seed_not_success", state=s0.get("state"), failures=len(s0.get("failures") or []))
             await req("DELETE", "/_snapshot/%s/seed" % repo)
         else:
             raise RuntimeError("seed snapshot not SUCCESS after retries")
@@ -597,22 +667,38 @@ async def _qos_baseline(es, params):
 
         before = await policy_names()
         first = None
+        probe_state = {}
         if monitor:
             # an earlier Rally already ran the catch-up; only keep recording snapshots under the same steady load
             ev("monitor_only", already_known=sorted(before))
         else:
-            await asyncio.sleep(warmup)
+            warm_end, probe_state, rates = time.time() + warmup, {}, []
+            while time.time() < warm_end:
+                r = await throughput_probe(probe_state)
+                if r is not None:
+                    rates.append(r)
+                await asyncio.sleep(min(60, max(0.0, warm_end - time.time())))
+            target = float(params.get("target-docs-per-s", 0))
+            if target and rates:
+                tail = sorted(rates[-5:])
+                ev("warm_gate", median_docs_per_s=round(tail[len(tail) // 2]), target=target, ok=tail[len(tail) // 2] >= 0.98 * target)
             copies, t0 = await plan_copies(), time.time()
+            await apply_arm_settings()
             ev("phase_c_start", copies=copies, tag=tag)
             for k in range(1, copies + 1):
                 await restore("seed", ",".join(seeds), "%s%s%d-" % (prefix, tag, k))
             ev("phase_c_done", copies=copies, duration_s=round(time.time() - t0, 1))
+            # let the tracker finish reading the restored copies before the catch-up, the same for every arm
+            await asyncio.sleep(float(params.get("pre-catchup-settle-seconds", 0)))
+            await write_shard_map("precatchup")
+            ev("settings_state", phase="pre_catchup", state=await cluster_settings())
             ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
             first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
             ev("catchup_started", snapshot=first)
         seen = set(before)
         errors = 0
         while time.time() < t_end:
+            await throughput_probe(probe_state if not monitor else {})
             try:
                 for n in sorted(await policy_names() - seen):
                     if n in ("seed",):
