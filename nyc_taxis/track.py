@@ -580,9 +580,11 @@ async def _qos_baseline(es, params):
         tag = params.get("copy-tag", "c")
         t_end = time.time() + total
         policy = params.get("policy") or next(iter(await req("GET", "/_slm/policy")))
-        ev("slm_stop", response=await req("POST", "/_slm/stop"))
-        while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
-            await asyncio.sleep(poll)
+        monitor = bool(params.get("monitor-only", False))
+        if not monitor:
+            ev("slm_stop", response=await req("POST", "/_slm/stop"))
+            while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
+                await asyncio.sleep(poll)
 
         async def policy_names():
             p = (await req("GET", "/_slm/policy/" + policy)).get(policy, {})
@@ -594,15 +596,20 @@ async def _qos_baseline(es, params):
             return {n for n in names if n}
 
         before = await policy_names()
-        await asyncio.sleep(warmup)
-        copies, t0 = await plan_copies(), time.time()
-        ev("phase_c_start", copies=copies, tag=tag)
-        for k in range(1, copies + 1):
-            await restore("seed", ",".join(seeds), "%s%s%d-" % (prefix, tag, k))
-        ev("phase_c_done", copies=copies, duration_s=round(time.time() - t0, 1))
-        ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
-        first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
-        ev("catchup_started", snapshot=first)
+        first = None
+        if monitor:
+            # an earlier Rally already ran the catch-up; only keep recording snapshots under the same steady load
+            ev("monitor_only", already_known=sorted(before))
+        else:
+            await asyncio.sleep(warmup)
+            copies, t0 = await plan_copies(), time.time()
+            ev("phase_c_start", copies=copies, tag=tag)
+            for k in range(1, copies + 1):
+                await restore("seed", ",".join(seeds), "%s%s%d-" % (prefix, tag, k))
+            ev("phase_c_done", copies=copies, duration_s=round(time.time() - t0, 1))
+            ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
+            first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
+            ev("catchup_started", snapshot=first)
         seen = set(before)
         errors = 0
         while time.time() < t_end:

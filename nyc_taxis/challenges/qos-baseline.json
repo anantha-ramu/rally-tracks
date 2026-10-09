@@ -85,6 +85,7 @@
                   "duration-seconds": {{qos_phase_b_seconds | default(7200)}},
                   "warmup-seconds": {{qos_warmup_seconds | default(600)}},
                   "copy-tag": "{{qos_copy_tag | default('c')}}",
+                  "monitor-only": {{qos_monitor_only | default(false) | tojson}},
                   "catchup-target-seconds": {{qos_catchup_target_seconds | default(1200)}},
                   "max-copies": {{qos_max_copies | default(12)}},
                   "timeout": {{(qos_phase_b_seconds | default(7200)) + 3600}}
