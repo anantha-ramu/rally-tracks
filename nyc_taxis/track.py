@@ -388,7 +388,18 @@ async def _qos_baseline(es, params):
         log.info("qos-baseline %s", kw)
 
     async def req(method, path, body=None, params_=None):
-        return _body(await es.perform_request(method=method, path=path, body=body, params=params_))
+        # idempotent calls survive a slow or briefly unreachable endpoint; restores and snapshot creation are not retried
+        attempts = 6 if method in ("GET", "DELETE") else 1
+        for i in range(attempts):
+            try:
+                return _body(await es.perform_request(method=method, path=path, body=body, params=params_))
+            except Exception as e:
+                status = getattr(getattr(e, "meta", None), "status", 0)
+                transient = type(e).__name__ in ("ConnectionTimeout", "ConnectionError", "TransportError") or status in (429, 502, 503, 504)
+                if not transient or i == attempts - 1:
+                    raise
+                ev("request_retry", method=method, path=path[:80], attempt=i + 1, error=type(e).__name__)
+                await asyncio.sleep(min(30, 5 * (i + 1)))
 
     async def wait_snapshot(name):
         while time.time() < deadline:
@@ -563,30 +574,51 @@ async def _qos_baseline(es, params):
 
     elif mode == "phase-b":
         # warm-up under steady load, then phase C: restore K copies of the seed (the backlog), then start SLM and
-        # run the policy once (the catch-up), then record every snapshot until the end
+        # run the policy once (the catch-up), then record every snapshot until the end. resume=true reruns this on
+        # existing data (earlier copies stay, new ones get copy-tag d), after a crash of an earlier phase B.
         total, warmup = float(params.get("duration-seconds", 7200)), float(params.get("warmup-seconds", 600))
+        tag = params.get("copy-tag", "c")
         t_end = time.time() + total
         policy = params.get("policy") or next(iter(await req("GET", "/_slm/policy")))
+        ev("slm_stop", response=await req("POST", "/_slm/stop"))
+        while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
+            await asyncio.sleep(poll)
+
+        async def policy_names():
+            p = (await req("GET", "/_slm/policy/" + policy)).get(policy, {})
+            names = {
+                (p.get("last_success") or {}).get("snapshot_name"),
+                (p.get("last_failure") or {}).get("snapshot_name"),
+                (p.get("in_progress") or {}).get("name"),
+            }
+            return {n for n in names if n}
+
+        before = await policy_names()
         await asyncio.sleep(warmup)
         copies, t0 = await plan_copies(), time.time()
-        ev("phase_c_start", copies=copies)
+        ev("phase_c_start", copies=copies, tag=tag)
         for k in range(1, copies + 1):
-            await restore("seed", ",".join(seeds), "%sc%d-" % (prefix, k))
+            await restore("seed", ",".join(seeds), "%s%s%d-" % (prefix, tag, k))
         ev("phase_c_done", copies=copies, duration_s=round(time.time() - t0, 1))
         ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
         first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
         ev("catchup_started", snapshot=first)
-        seen = set()
+        seen = set(before)
+        errors = 0
         while time.time() < t_end:
-            cur = await req("GET", "/_snapshot/%s/_all" % repo, params_={"sort": "start_time", "order": "desc", "size": "5"})
-            for s in cur.get("snapshots", []):
-                n = s.get("snapshot")
-                if n in seen or n == "seed" or s.get("state") not in ("SUCCESS", "PARTIAL", "FAILED"):
-                    continue
-                seen.add(n)
-                await wait_snapshot(n)
+            try:
+                for n in sorted(await policy_names() - seen):
+                    if n in ("seed",):
+                        continue
+                    cur = (await req("GET", "/_snapshot/%s/%s" % (repo, n))).get("snapshots", [{}])[0]
+                    if cur.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
+                        seen.add(n)
+                        await wait_snapshot(n)
+            except Exception as e:
+                errors += 1
+                ev("loop_error", errors=errors, error=repr(e)[:200])
             await asyncio.sleep(30)
-        ev("phase_b_done", snapshots=sorted(seen), catchup=first)
+        ev("phase_b_done", snapshots=sorted(seen - before), catchup=first, loop_errors=errors)
     ev("end", mode=mode)
     return {"weight": 1, "unit": "ops", "success": True}
 
