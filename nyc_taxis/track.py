@@ -413,12 +413,40 @@ async def _qos_baseline(es, params):
                 ev("request_retry", method=method, path=path[:80], attempt=i + 1, error=type(e).__name__, status=status_of(e))
                 await asyncio.sleep(min(30, 5 * (i + 1)))
 
+    def save_status(name, s0, snap_status):
+        # per-shard incremental sizes of a finished snapshot, written once here (the status call is already made) so that the measurement can read
+        # a small file instead of asking the cluster for the status of 300+ shards again
+        try:
+            shards = {}
+            for idx, v in (snap_status.get("indices") or {}).items():
+                for sid, sh in (v.get("shards") or {}).items():
+                    shards["%s|%s" % (idx, sid)] = ((sh.get("stats") or {}).get("incremental") or {}).get("size_in_bytes", 0)
+            stats = snap_status.get("stats") or {}
+            path = os.path.expanduser("~/qos-status-%s.json" % name)
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "snapshot": name,
+                        "state": s0.get("state"),
+                        "start": s0.get("start_time_in_millis"),
+                        "end": s0.get("end_time_in_millis"),
+                        "total_bytes": (stats.get("total") or {}).get("size_in_bytes"),
+                        "incremental_bytes": (stats.get("incremental") or {}).get("size_in_bytes"),
+                        "time_ms": stats.get("time_in_millis"),
+                        "shards": shards,
+                    },
+                    f,
+                )
+        except Exception as e:  # never let bookkeeping stop the run
+            ev("save_status_failed", snapshot=name, error=repr(e)[:200])
+
     async def wait_snapshot(name):
         while time.time() < deadline:
             s0 = (await req("GET", "/_snapshot/%s/%s" % (repo, name))).get("snapshots", [{}])[0]
             if s0.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
                 st = await req("GET", "/_snapshot/%s/%s/_status" % (repo, name))
                 tot = st.get("snapshots", [{}])[0].get("stats", {})
+                save_status(name, s0, st.get("snapshots", [{}])[0])
                 ev(
                     "snapshot_done",
                     snapshot=name,
