@@ -389,18 +389,28 @@ async def _qos_baseline(es, params):
         kw.update(event=name, t=int(time.time() * 1000), ts=time.strftime("%H:%M:%S", time.gmtime()))
         log.info("qos-baseline %s", kw)
 
-    async def req(method, path, body=None, params_=None):
-        # idempotent calls survive a slow or briefly unreachable endpoint; restores and snapshot creation are not retried
-        attempts = 6 if method in ("GET", "DELETE") else 1
+    def status_of(e):
+        return getattr(getattr(e, "meta", None), "status", 0) or getattr(e, "status_code", 0) or 0
+
+    def transient(e, any_5xx=False):
+        st = status_of(e)
+        return (
+            type(e).__name__ in ("ConnectionTimeout", "ConnectionError", "TransportError")
+            or st in (429, 502, 503, 504)
+            or (any_5xx and st >= 500)
+        )
+
+    async def req(method, path, body=None, params_=None, retry=False):
+        # reads and deletes survive a slow or briefly unreachable endpoint. Writes are retried only when the caller says the call is
+        # idempotent (retry=True): the settings PUT, _flush, _slm/start. Restores and snapshot creation have their own handling.
+        attempts = 6 if (method in ("GET", "DELETE") or retry) else 1
         for i in range(attempts):
             try:
                 return _body(await es.perform_request(method=method, path=path, body=body, params=params_))
             except Exception as e:
-                status = getattr(getattr(e, "meta", None), "status", 0)
-                transient = type(e).__name__ in ("ConnectionTimeout", "ConnectionError", "TransportError") or status in (429, 502, 503, 504)
-                if not transient or i == attempts - 1:
+                if not transient(e, any_5xx=retry) or i == attempts - 1:
                     raise
-                ev("request_retry", method=method, path=path[:80], attempt=i + 1, error=type(e).__name__)
+                ev("request_retry", method=method, path=path[:80], attempt=i + 1, error=type(e).__name__, status=status_of(e))
                 await asyncio.sleep(min(30, 5 * (i + 1)))
 
     async def wait_snapshot(name):
@@ -448,14 +458,42 @@ async def _qos_baseline(es, params):
             "rename_replacement": rename_to + "$1",
             "index_settings": {"index.number_of_replicas": 0},
         }
+        path = "/_snapshot/%s/%s/_restore" % (repo, snapshot)
+
+        async def exists():
+            rows = await req("GET", "/_cat/indices/%s*" % rename_to, params_={"format": "json", "h": "index"})
+            return bool(rows)
+
+        async def post(b):
+            # a restore is not idempotent: after a timeout, look whether the request took effect before sending it again
+            for i in range(6):
+                try:
+                    await req("POST", path, body=b)
+                    return
+                except Exception as e:
+                    if not transient(e) or i == 5:
+                        raise
+                    if await exists():
+                        ev("restore_accepted_after_timeout", rename_to=rename_to, error=type(e).__name__)
+                        return
+                    ev("restore_retry", rename_to=rename_to, attempt=i + 1, error=type(e).__name__, status=status_of(e))
+                    await asyncio.sleep(min(30, 5 * (i + 1)))
+
+        replicas = 0
         try:
-            await req("POST", "/_snapshot/%s/%s/_restore" % (repo, snapshot), body=body)
-            replicas = 0
+            await post(body)
         except Exception as e:
-            # keep replicas if the operator user may not change them; noted in the results
-            ev("restore_replicas0_refused", error=str(getattr(e, "body", "") or repr(e))[:500])
+            text = str(getattr(e, "body", "") or repr(e))
+            # a real refusal of the replicas setting (not a timeout or a server error)
+            refused = status_of(e) in (400, 403) or "number_of_replicas" in text
+            if not refused:
+                raise
+            ev("restore_replicas0_refused", error=text[:500])
+            if params.get("strict", False):
+                # every arm must restore the same way: a restore with replicas would put copies on the search tier
+                invalid("restore_replicas0_refused", error=text[:200])
             del body["index_settings"]
-            await req("POST", "/_snapshot/%s/%s/_restore" % (repo, snapshot), body=body)
+            await post(body)
             replicas = None
         ev("restore_start", snapshot=snapshot, indices=indices, rename_to=rename_to, replicas=replicas)
         await wait_green(rename_to + "*")
@@ -485,7 +523,7 @@ async def _qos_baseline(es, params):
         if not want:
             ev("settings_applied", applied={}, state=await cluster_settings())
             return
-        await req("PUT", "/_cluster/settings", body={"persistent": want})
+        await req("PUT", "/_cluster/settings", body={"persistent": want}, retry=True)
         state = await cluster_settings()
         missing = {k: v for k, v in want.items() if str(state.get(k)).lower() != str(v).lower()}
         ev("settings_applied", applied=want, state=state, missing=missing)
@@ -625,18 +663,36 @@ async def _qos_baseline(es, params):
         ev("settings_state", phase="seed", state=state)
         if params.get("strict", False) and switches_on(state):
             invalid("switches_on_at_seed", switches=switches_on(state))
-        await req("POST", "/%s/_flush" % ",".join(seeds))
-        attempts = 1 if params.get("strict", False) else int(params.get("seed-attempts", 3))
+        await req("POST", "/%s/_flush" % ",".join(seeds), retry=True)
+        strict = params.get("strict", False)
+        attempts = 2 if strict else int(params.get("seed-attempts", 3))
+        reasons = []
         for attempt in range(1, attempts + 1):
             await req("PUT", "/_snapshot/%s/seed" % repo, body={"indices": ",".join(seeds), "include_global_state": False})
             s0, _ = await wait_snapshot("seed")
             if s0.get("state") == "SUCCESS":
+                if attempt > 1:
+                    # iteration 3: exactly one retry is allowed; the starting state after a successful retry is identical. Flagged, and the
+                    # seed rate of a retried arm is informational only
+                    ev("seed_retried", attempts=attempt, previous_failures=reasons)
                 break
             # copies are restored from the seed, so it must be complete; the failed attempt stays in the log
-            ev("seed_retry", attempt=attempt, state=s0.get("state"))
-            if params.get("strict", False):
-                # iteration 3: a retried or PARTIAL seed makes the arm incomparable, so stop instead of retrying
-                invalid("seed_not_success", state=s0.get("state"), failures=len(s0.get("failures") or []))
+            reasons.append(
+                {
+                    "attempt": attempt,
+                    "state": s0.get("state"),
+                    "failures": len(s0.get("failures") or []),
+                    "reasons": sorted({(f.get("reason") or "")[:110] for f in (s0.get("failures") or [])})[:3],
+                }
+            )
+            ev("seed_retry", attempt=attempt, state=s0.get("state"), reasons=reasons[-1]["reasons"])
+            if attempt == attempts:
+                if strict:
+                    invalid("seed_not_success_after_retry", attempts=attempt, failures=reasons)
+                break
+            # nothing may still be running before the seed is taken again, and the failed seed must not be restorable
+            while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
+                await asyncio.sleep(poll)
             await req("DELETE", "/_snapshot/%s/seed" % repo)
         else:
             raise RuntimeError("seed snapshot not SUCCESS after retries")
@@ -692,8 +748,22 @@ async def _qos_baseline(es, params):
             await asyncio.sleep(float(params.get("pre-catchup-settle-seconds", 0)))
             await write_shard_map("precatchup")
             ev("settings_state", phase="pre_catchup", state=await cluster_settings())
-            ev("slm_start", response=await req("POST", "/_slm/start"), policy=policy)
-            first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
+            ev("slm_start", response=await req("POST", "/_slm/start", retry=True), policy=policy)
+            known = set(await policy_names())
+            try:
+                first = (await req("POST", "/_slm/policy/%s/_execute" % policy)).get("snapshot_name")
+            except Exception as e:
+                # the execute call is not idempotent: do not repeat it. If it started the snapshot, take the name from the policy
+                ev("execute_failed", error=type(e).__name__, status=status_of(e))
+                first = None
+                for _ in range(12):
+                    p = (await req("GET", "/_slm/policy/" + policy)).get(policy, {})
+                    first = (p.get("in_progress") or {}).get("name") or next(iter(sorted(await policy_names() - known)), None)
+                    if first:
+                        break
+                    await asyncio.sleep(5)
+                if not first:
+                    invalid("catchup_not_started", error=type(e).__name__)
             ev("catchup_started", snapshot=first)
         seen = set(before)
         errors = 0
