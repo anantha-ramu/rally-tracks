@@ -622,6 +622,16 @@ async def _qos_baseline(es, params):
         )
         return copies
 
+    def shape_ok(cur):
+        """The index tier is on its target shape: an expected node count (a comma list is accepted, e.g. "2,3" for the 16 GiB arms), all nodes the same
+        size, and, when expected-index-gib is given, that size (a comma list is accepted). Without the size a tier of the wrong step would pass.
+        """
+        counts = {int(x) for x in str(params.get("expected-index-nodes", 3)).split(",") if x.strip()}
+        gibs = [float(x) for x in str(params.get("expected-index-gib", "")).split(",") if x.strip()]
+        if len(cur) not in counts or len({n[1] for n in cur}) != 1:
+            return False
+        return not gibs or any(abs(cur[0][1] - g) <= 0.6 for g in gibs)
+
     async def index_nodes():
         r = await req(
             "GET",
@@ -660,14 +670,14 @@ async def _qos_baseline(es, params):
             },
         )
         # wait until the index tier has the expected node count for stable-seconds (the floor needs a few minutes)
-        want, stable = int(params.get("expected-index-nodes", 3)), float(params.get("stable-seconds", 300))
+        stable = float(params.get("stable-seconds", 300))
         prev, since = None, time.time()
         while time.time() < deadline:
             cur = await index_nodes()
             if cur != prev:
                 ev("index_nodes", nodes=cur)
                 prev, since = cur, time.time()
-            if len(cur) == want and time.time() - since >= stable:
+            if shape_ok(cur) and time.time() - since >= stable:
                 break
             await asyncio.sleep(30)
         # restore smoke test, so a refused restore fails the run in minutes rather than hours
@@ -687,8 +697,7 @@ async def _qos_baseline(es, params):
     elif mode == "seed":
         # the seed snapshot gives the arm's clean rate, so it must run on the target shape: wait until the index tier
         # has the expected node count, all the same size, for a while; give up after gate-seconds (relaunch the arm)
-        want, stable, gate_end = (
-            int(params.get("expected-index-nodes", 3)),
+        stable, gate_end = (
             float(params.get("stable-seconds", 120)),
             time.time() + float(params.get("gate-seconds", 2700)),
         )
@@ -698,7 +707,7 @@ async def _qos_baseline(es, params):
             if cur != prev:
                 ev("index_nodes", nodes=cur)
                 prev, since = cur, time.time()
-            if len(cur) == want and len({n[1] for n in cur}) == 1 and time.time() - since >= stable:
+            if shape_ok(cur) and time.time() - since >= stable:
                 ev("seed_gate_open", nodes=cur)
                 break
             if time.time() > gate_end:

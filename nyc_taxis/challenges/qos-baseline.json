@@ -11,7 +11,8 @@
           "operation": {
             "operation-type": "qos-baseline",
             "mode": "prepare",
-            "expected-index-nodes": {{qos_expected_index_nodes | default(3)}},
+            "expected-index-nodes": "{{qos_expected_index_nodes | default(3)}}",
+            "expected-index-gib": "{{qos_expected_index_gib | default('')}}",
             "timeout": 3600
           }
         },
@@ -65,7 +66,8 @@
             "operation-type": "qos-baseline",
             "mode": "seed",
             "indices": {{qos_n}},
-            "expected-index-nodes": {{qos_expected_index_nodes | default(3)}},
+            "expected-index-nodes": "{{qos_expected_index_nodes | default(3)}}",
+            "expected-index-gib": "{{qos_expected_index_gib | default('')}}",
             "strict": {{qos_strict | default(false) | tojson}},
             "fixed-copies": {{qos_fixed_copies | default(0)}},
             "catchup-target-seconds": {{qos_catchup_target_seconds | default(1200)}},
