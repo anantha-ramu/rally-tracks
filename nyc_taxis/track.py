@@ -464,16 +464,32 @@ async def _qos_baseline(es, params):
             rows = await req("GET", "/_cat/indices/%s*" % rename_to, params_={"format": "json", "h": "index"})
             return bool(rows)
 
+        async def appeared(seconds=60):
+            # a timed-out POST may still be running on the master: give it time to show up before deciding it did not happen
+            for _ in range(max(1, int(seconds // 5))):
+                if await exists():
+                    return True
+                await asyncio.sleep(5)
+            return await exists()
+
         async def post(b):
-            # a restore is not idempotent: after a timeout, look whether the request took effect before sending it again
+            # a restore is not idempotent: after a timeout, wait and look whether the request took effect before sending it again
+            timed_out = False
             for i in range(6):
                 try:
                     await req("POST", path, body=b)
                     return
                 except Exception as e:
-                    if not transient(e) or i == 5:
+                    if not transient(e):
+                        if timed_out and await exists():
+                            # the earlier attempt took effect; this error (typically 'index already exists') is its echo
+                            ev("restore_accepted_after_retry_error", rename_to=rename_to, status=status_of(e))
+                            return
                         raise
-                    if await exists():
+                    timed_out = True
+                    if i == 5:
+                        raise
+                    if await appeared():
                         ev("restore_accepted_after_timeout", rename_to=rename_to, error=type(e).__name__)
                         return
                     ev("restore_retry", rename_to=rename_to, attempt=i + 1, error=type(e).__name__, status=status_of(e))
@@ -484,9 +500,11 @@ async def _qos_baseline(es, params):
             await post(body)
         except Exception as e:
             text = str(getattr(e, "body", "") or repr(e))
-            # a real refusal of the replicas setting (not a timeout or a server error)
-            refused = status_of(e) in (400, 403) or "number_of_replicas" in text
+            # a replicas refusal: the body says so, or the operator is forbidden (403). Any other 400 is a different problem and is reported as it is
+            refused = status_of(e) == 403 or "number_of_replicas" in text
             if not refused:
+                if params.get("strict", False) and status_of(e) == 400:
+                    invalid("restore_rejected", status=400, detail=text[:300])
                 raise
             ev("restore_replicas0_refused", error=text[:500])
             if params.get("strict", False):
@@ -693,7 +711,22 @@ async def _qos_baseline(es, params):
             # nothing may still be running before the seed is taken again, and the failed seed must not be restorable
             while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
                 await asyncio.sleep(poll)
-            await req("DELETE", "/_snapshot/%s/seed" % repo)
+            try:
+                await req("DELETE", "/_snapshot/%s/seed" % repo)
+            except Exception as e:
+                if status_of(e) != 404:  # a retried DELETE that finds it already gone is fine
+                    raise
+            # the delete runs on the master and the snapshot name stays taken until it is done: wait for the 404
+            for _ in range(60):
+                try:
+                    await req("GET", "/_snapshot/%s/seed" % repo)
+                except Exception as e:
+                    if status_of(e) == 404:
+                        break
+                    raise
+                await asyncio.sleep(5)
+            else:
+                invalid("seed_delete_not_finished")
         else:
             raise RuntimeError("seed snapshot not SUCCESS after retries")
         await plan_copies()
