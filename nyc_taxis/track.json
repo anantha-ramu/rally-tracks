@@ -31,7 +31,11 @@
     {
       "name": "qos-{{i}}",
       "body": "index.json"
-    }{% endfor %}
+    }{% endfor %}{% if qos_splits | default(false) %},
+    {
+      "name": "split-1p",
+      "body": "index.json"
+    }{% endif %}
   ],
   "corpora": [
     {

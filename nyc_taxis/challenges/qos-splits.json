@@ -1,0 +1,148 @@
+    {% set qos_n = qos_indices | default(4) %}
+    {% set qos_bulk = qos_bulk_size | default(5000) %}
+    {% set qos_tput = (qos_rate | default(20000)) / qos_n / qos_bulk %}
+    {% set qos_seed_tput = (qos_seed_rate | default(120000)) / qos_n / qos_bulk %}
+    {
+      "name": "qos-splits",
+      "description": "Experiment for the snapshot backlog tracker after auto-splits (not for merge). Several seed indices at a low steady indexing rate; a one-primary index (split-1p) fed by the runner past the auto-reshard threshold twice (1 -> 2 -> 4 shards); a direct snapshot of it before the first split and after each split. SLM stays stopped.",
+      "schedule": [
+        {
+          "name": "qos-prepare",
+          "operation": {
+            "operation-type": "qos-baseline",
+            "mode": "prepare",
+            "expected-index-nodes": "{{qos_expected_index_nodes | default(3)}}",
+            "expected-index-gib": "{{qos_expected_index_gib | default('')}}",
+            "timeout": 3600
+          }
+        },
+        {% for i in range(qos_n) %}
+        {
+          "name": "delete-qos-{{i}}",
+          "operation": {"operation-type": "delete-index", "index": "qos-{{i}}"}
+        },
+        {
+          "name": "create-qos-{{i}}",
+          "operation": {
+            "operation-type": "create-index",
+            "index": "qos-{{i}}",
+            "settings": {"index.refresh_interval": "30s", "index.number_of_replicas": 1}
+          }
+        },
+        {% endfor %}
+        {
+          "name": "delete-split-1p",
+          "operation": {"operation-type": "delete-index", "index": "split-1p"}
+        },
+        {
+          "name": "create-split-1p",
+          "operation": {
+            "operation-type": "create-index",
+            "index": "split-1p",
+            "settings": {"index.refresh_interval": "30s", "index.number_of_replicas": 1, "index.number_of_shards": 1}
+          }
+        },
+        {
+          "name": "check-cluster-health",
+          "operation": {
+            "operation-type": "cluster-health",
+            "index": "qos-*,split-1p",
+            "request-params": {"wait_for_status": "green", "wait_for_no_relocating_shards": "true"},
+            "retry-until-success": true
+          }
+        },
+        {
+          "parallel": {
+            "tasks": [
+              {% for i in range(qos_n) %}
+              {
+                "name": "seed-qos-{{i}}",
+                "operation": {
+                  "operation-type": "bulk",
+                  "corpora": "qos",
+                  "indices": ["qos-{{i}}"],
+                  "bulk-size": {{qos_bulk}},
+                  "ingest-percentage": {{qos_seed_percentage | default(22)}}
+                },
+                "clients": {{qos_seed_clients | default(10)}},
+                "target-throughput": {{qos_seed_tput}},
+                "ignore-response-error-level": "non-fatal"
+              }{{ "," if not loop.last }}
+              {% endfor %}
+            ]
+          }
+        },
+        {
+          "name": "qos-splits-seed",
+          "operation": {
+            "operation-type": "qos-baseline",
+            "mode": "splits-seed",
+            "indices": {{qos_n}},
+            "expected-index-nodes": "{{qos_expected_index_nodes | default(3)}}",
+            "expected-index-gib": "{{qos_expected_index_gib | default('')}}",
+            "strict": {{qos_strict | default(false) | tojson}},
+            "timeout": 10800
+          }
+        },
+        {
+          "parallel": {
+            "completed-by": "qos-splits-run",
+            "tasks": [
+              {
+                "name": "qos-splits-run",
+                "operation": {
+                  "operation-type": "qos-baseline",
+                  "mode": "splits-run",
+                  "indices": {{qos_n}},
+                  "split-index": "split-1p",
+                  "duration-seconds": {{qos_phase_b_seconds | default(21600)}},
+                  "warmup-seconds": {{qos_warmup_seconds | default(600)}},
+                  "apply-settings": {{qos_apply_settings | default({}) | tojson}},
+                  "target-docs-per-s": {{qos_rate | default(20000)}},
+                  "horizon-seconds": {{qos_horizon_seconds | default(18000)}},
+                  "threshold-margin": {{qos_threshold_margin | default(1.3)}},
+                  "max-threshold-gib": {{qos_max_threshold_gib | default(24)}},
+                  "tracker-settle-seconds": {{qos_tracker_settle_seconds | default(150)}},
+                  "feed-concurrency": {{qos_feed_concurrency | default(8)}},
+                  "timeout": {{(qos_phase_b_seconds | default(21600)) + 3600}}
+                }
+              },
+              {% for i in range(qos_n) %}
+              {
+                "name": "steady-qos-{{i}}",
+                "operation": {
+                  "operation-type": "bulk",
+                  "corpora": "qos",
+                  "indices": ["qos-{{i}}"],
+                  "bulk-size": {{qos_bulk}},
+                  "looped": true
+                },
+                "clients": {{qos_bulk_clients | default(2)}},
+                "warmup-time-period": 0,
+                "time-period": {{(qos_phase_b_seconds | default(21600)) + 3600}},
+                "target-throughput": {{qos_tput}},
+                "ignore-response-error-level": "non-fatal"
+              },
+              {% endfor %}
+              {
+                "name": "steady-search",
+                "operation": {
+                  "operation-type": "search",
+                  "index": "{% for i in range(qos_n) %}qos-{{i}}{{ "," if not loop.last }}{% endfor %}",
+                  "body": {
+                    "size": 10,
+                    "query": {"range": {"total_amount": {"gte": 5, "lt": 15}}},
+                    "aggs": {"fare": {"avg": {"field": "fare_amount"}}}
+                  }
+                },
+                "clients": {{qos_search_clients | default(2)}},
+                "warmup-time-period": 0,
+                "time-period": {{(qos_phase_b_seconds | default(21600)) + 3600}},
+                "target-throughput": {{qos_search_rate | default(2)}},
+                "ignore-response-error-level": "non-fatal"
+              }
+            ]
+          }
+        }
+      ]
+    }

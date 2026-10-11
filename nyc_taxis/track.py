@@ -364,6 +364,160 @@ def _shard_summary(status):
     }
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# m2s1 (shard splits): helpers for the qos-baseline modes "splits-seed" and "splits-run". Kept at module level so that the fake-ES tests can import them.
+# ----------------------------------------------------------------------------------------------------------------------
+GIB = 2**30
+CONTROL_PATH = "~/m2s1-control.json"
+
+
+def _control():
+    """Operator overrides read at every loop iteration of the splits run: {"threshold_gib": n, "detect": "state"|"shards-stable", "feed_pause": bool, "expunge": bool}."""
+    try:
+        with open(os.path.expanduser(CONTROL_PATH)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+class _Feeder:
+    """Writes documents of the nyc_taxis corpus (one JSON document per line) into a single index through its own bulk requests, so that the run can pause and resume
+    the writes of that index at will (a Rally bulk task cannot be paused). pause() returns only when no request is in flight."""
+
+    def __init__(self, req, ev, index, path, batch=5000, concurrency=8, offset_fraction=0.5):
+        self.req, self.ev, self.index, self.path = req, ev, index, os.path.expanduser(path)
+        self.batch, self.concurrency = batch, concurrency
+        self.paused, self.stopped, self.in_flight = True, False, 0
+        self.docs, self.rejections, self.errors, self.bulk_errors = 0, 0, 0, 0
+        self._lock = asyncio.Lock()
+        self._fh = None
+        self._offset_fraction = offset_fraction
+        self._tasks = []
+
+    def _open(self):
+        self._fh = open(self.path, "rb")
+        size = os.fstat(self._fh.fileno()).st_size
+        self._fh.seek(int(size * self._offset_fraction))
+        self._fh.readline()  # align to the next line start
+
+    def _read_batch(self):
+        lines = []
+        while len(lines) < self.batch:
+            line = self._fh.readline()
+            if not line:
+                self._fh.seek(0)
+                continue
+            lines.append(line if line.endswith(b"\n") else line + b"\n")
+        return b"".join(b'{"index":{}}\n' + l for l in lines), len(lines)
+
+    async def _worker(self):
+        while not self.stopped:
+            if self.paused:
+                await asyncio.sleep(1)
+                continue
+            self.in_flight += 1   # claimed before the batch is read: pause() waits for every claimed worker, and a worker that claimed before the pause re-checks it before sending
+            try:
+                async with self._lock:
+                    if self._fh is None:
+                        await asyncio.to_thread(self._open)
+                    body, n = await asyncio.to_thread(self._read_batch)
+                for attempt in range(8):
+                    if self.paused:
+                        break
+                    try:
+                        r = await self.req(
+                            "POST",
+                            "/%s/_bulk" % self.index,
+                            body=body,
+                            params_={"filter_path": "errors,items.*.status"},
+                            headers={"Content-Type": "application/x-ndjson", "Accept": "application/json"},
+                        )
+                    except Exception as e:
+                        st = getattr(getattr(e, "meta", None), "status", 0) or getattr(e, "status_code", 0) or 0
+                        if st == 429:
+                            self.rejections += 1
+                        else:
+                            self.errors += 1
+                        await asyncio.sleep(min(30, 2 * (attempt + 1)))
+                        continue
+                    if r.get("errors"):
+                        self.bulk_errors += 1
+                        bad = sum(1 for it in r.get("items", []) if list(it.values())[0].get("status", 200) >= 300)
+                        if bad == n:
+                            await asyncio.sleep(min(30, 2 * (attempt + 1)))
+                            continue
+                    self.docs += n
+                    break
+            finally:
+                self.in_flight -= 1
+
+    def start(self):
+        self._tasks = [asyncio.ensure_future(self._worker()) for _ in range(self.concurrency)]
+
+    async def resume(self, why):
+        if self.paused:
+            self.paused = False
+            self.ev("feed_resumed", why=why, docs=self.docs)
+
+    async def pause(self, why):
+        was = self.paused
+        self.paused = True
+        while self.in_flight:
+            await asyncio.sleep(0.5)
+        if not was:
+            self.ev("feed_paused", why=why, docs=self.docs, rejections=self.rejections, errors=self.errors, bulk_errors=self.bulk_errors)
+
+    async def stop(self):
+        await self.pause("stop")
+        self.stopped = True
+        for t in self._tasks:
+            t.cancel()
+
+
+async def _index_usage(req, index):
+    """Per primary shard of the index: total data set bytes (what the auto-reshard monitor compares), docs and deleted docs, from indices stats; plus the number of primary shards
+    in the index settings. -> {"shards": {sid: {"bytes", "docs", "deleted"}}, "n_shards": int, "total", "avg", "deletes_pct"}"""
+    st = await req("GET", "/%s/_stats/store,docs" % index, params_={"level": "shards", "filter_path": "indices.*.shards.*.routing.primary,indices.*.shards.*.store,indices.*.shards.*.docs"}, retry=True)
+    shards = {}
+    for _, v in (st.get("indices") or {}).items():
+        for sid, copies in (v.get("shards") or {}).items():
+            for c in copies:
+                if not (c.get("routing") or {}).get("primary", True):
+                    continue
+                s = c.get("store") or {}
+                d = c.get("docs") or {}
+                cur = shards.setdefault(int(sid), {"bytes": 0, "docs": 0, "deleted": 0})
+                cur["bytes"] = max(cur["bytes"], s.get("total_data_set_size_in_bytes", s.get("size_in_bytes", 0)))
+                cur["docs"] = max(cur["docs"], d.get("count", 0))
+                cur["deleted"] = max(cur["deleted"], d.get("deleted", 0))
+    se = await req("GET", "/%s/_settings" % index, params_={"filter_path": "*.settings.index.number_of_shards"}, retry=True)
+    n = int(next(iter(se.values()))["settings"]["index"]["number_of_shards"]) if se else len(shards)
+    total = sum(s["bytes"] for s in shards.values())
+    docs = sum(s["docs"] for s in shards.values())
+    dele = sum(s["deleted"] for s in shards.values())
+    return {"shards": shards, "n_shards": n, "total": total, "avg": total // max(1, n), "deletes_pct": round(100.0 * dele / (docs + dele), 2) if docs + dele else 0.0}
+
+
+async def _resharding_state(req, index, mode):
+    """True if resharding metadata exists for the index (a split is running), False if not, None if it cannot be read.
+    mode "state": cluster state metadata of the index (key "resharding", IndexMetadata.KEY_RESHARDING); the index has to be listed (its "state" is requested too), so an
+    empty answer from a wrong key or a filtered route is "cannot be read", never "no resharding". Any other mode: None (the caller decides)."""
+    if mode != "state":
+        return None
+    try:
+        r = await req(
+            "GET",
+            "/_cluster/state/metadata/%s" % index,
+            params_={"filter_path": "metadata.indices.%s.state,metadata.indices.%s.resharding" % (index, index)},
+        )
+    except Exception:
+        return None
+    imd = ((r.get("metadata") or {}).get("indices") or {}).get(index)
+    if not imd or "state" not in imd:
+        return None
+    return bool(imd.get("resharding"))
+
+
 async def qos_baseline_async(es, params):
     import logging
 
@@ -400,13 +554,13 @@ async def _qos_baseline(es, params):
             or (any_5xx and st >= 500)
         )
 
-    async def req(method, path, body=None, params_=None, retry=False):
+    async def req(method, path, body=None, params_=None, retry=False, headers=None):
         # reads and deletes survive a slow or briefly unreachable endpoint. Writes are retried only when the caller says the call is
         # idempotent (retry=True): the settings PUT, _flush, _slm/start. Restores and snapshot creation have their own handling.
         attempts = 6 if (method in ("GET", "DELETE") or retry) else 1
         for i in range(attempts):
             try:
-                return _body(await es.perform_request(method=method, path=path, body=body, params=params_))
+                return _body(await es.perform_request(method=method, path=path, body=body, params=params_, **({"headers": headers} if headers else {})))
             except Exception as e:
                 if not transient(e, any_5xx=retry) or i == attempts - 1:
                     raise
@@ -852,6 +1006,253 @@ async def _qos_baseline(es, params):
                 ev("loop_error", errors=errors, error=repr(e)[:200])
             await asyncio.sleep(30)
         ev("phase_b_done", snapshots=sorted(seen - before), catchup=first, loop_errors=errors)
+    elif mode == "splits-seed":
+        # as the seed mode up to the seed itself: the index tier is on its target shape and the switches are off, then flush. No seed snapshot and no restores: the
+        # arm does not catch up; the seed indices only have to exist at a known shard size (the threshold is derived from it in splits-run).
+        stable, gate_end = float(params.get("stable-seconds", 120)), time.time() + float(params.get("gate-seconds", 2700))
+        prev, since = None, time.time()
+        while True:
+            cur = await index_nodes()
+            if cur != prev:
+                ev("index_nodes", nodes=cur)
+                prev, since = cur, time.time()
+            if shape_ok(cur) and time.time() - since >= stable:
+                ev("seed_gate_open", nodes=cur)
+                break
+            if time.time() > gate_end:
+                ev("seed_gate_timeout", nodes=cur)
+                raise RuntimeError("index tier not on its target shape: %s" % (cur,))
+            await asyncio.sleep(30)
+        state = await cluster_settings()
+        ev("settings_state", phase="seed", state=state)
+        if params.get("strict", False) and switches_on(state):
+            invalid("switches_on_at_seed", switches=switches_on(state))
+        await req("POST", "/%s/_flush" % ",".join(seeds), retry=True)
+        sizes = {}
+        for s_ in seeds:
+            u = await _index_usage(req, s_)
+            sizes[s_] = {"n_shards": u["n_shards"], "max_shard_bytes": max([v["bytes"] for v in u["shards"].values()] or [0]), "total_bytes": u["total"]}
+        ev("splits_seed_done", sizes=sizes, max_shard_gib=round(max(v["max_shard_bytes"] for v in sizes.values()) / GIB, 2))
+
+    elif mode == "splits-run":
+        # warm-up under the steady load, then: settings on, threshold T from the seed shard sizes, a pre-split snapshot of the split index, split 1 (1 -> 2), its snapshot,
+        # split 2 (2 -> 4), its snapshot. SLM stays stopped for the whole run: every snapshot is a direct PUT.
+        split_idx = params.get("split-index", "split-1p")
+        total_s, warmup = float(params.get("duration-seconds", 21600)), float(params.get("warmup-seconds", 600))
+        t_end = time.time() + total_s
+        policy = params.get("policy") or next(iter(await req("GET", "/_slm/policy")))
+        ev("slm_stop", response=await req("POST", "/_slm/stop"))
+        while (await req("GET", "/_snapshot/%s/_current" % repo)).get("snapshots"):
+            await asyncio.sleep(poll)
+        settle_s = float(params.get("tracker-settle-seconds", 150))
+        trigger_timeout = float(params.get("split-trigger-timeout-seconds", 2400))
+        corpus = params.get("corpus-path", "~/.rally/benchmarks/data/qos/documents.json")
+        names = []
+
+        def attention(reason, **kw):
+            ev("splits_attention", reason=reason, **kw)
+
+        ticks = {}
+
+        def every(key, secs):
+            if time.time() - ticks.get(key, 0) >= secs:
+                ticks[key] = time.time()
+                return True
+            return False
+
+        # warm window: the seed indices grow under the foreground load; their growth sets the threshold
+        probe_state, rates = {}, []
+        usage0 = {s_: await _index_usage(req, s_) for s_ in seeds}
+        warm_t0 = time.time()
+        while time.time() < warm_t0 + warmup:
+            r = await throughput_probe(probe_state)
+            if r is not None:
+                rates.append(r)
+            await asyncio.sleep(min(60, max(0.0, warm_t0 + warmup - time.time())))
+        target = float(params.get("target-docs-per-s", 0))
+        if target and rates:
+            tail = sorted(rates[-5:])
+            ev("warm_gate", median_docs_per_s=round(tail[len(tail) // 2]), target=target, ok=tail[len(tail) // 2] >= 0.98 * target)
+        usage1 = {s_: await _index_usage(req, s_) for s_ in seeds}
+        dt = max(1.0, time.time() - warm_t0)
+        grow = [
+            (v["bytes"] - usage0[i]["shards"][sid]["bytes"]) / dt
+            for i, u in usage1.items()
+            for sid, v in u["shards"].items()
+            if sid in usage0[i]["shards"]
+        ]
+        g = max(0.0, sum(grow) / len(grow)) if grow else 0.0
+        s_max = max([v["bytes"] for u in usage1.values() for v in u["shards"].values()] or [0])
+        horizon = float(params.get("horizon-seconds", 18000))
+        margin = float(params.get("threshold-margin", 1.3))
+        calc_gib = math.ceil(margin * (s_max + g * horizon) / GIB)
+        thr_gib = int(_control().get("threshold_gib") or params.get("threshold-gib") or calc_gib)
+        cap_gib = int(params.get("max-threshold-gib", 24))
+        ev("threshold_calc", seed_max_shard_gib=round(s_max / GIB, 2), growth_bytes_per_s_per_shard=round(g), horizon_s=horizon, margin=margin, calculated_gib=calc_gib, used_gib=thr_gib, cap_gib=cap_gib)
+        if thr_gib > cap_gib:
+            invalid("threshold_above_cap", threshold_gib=thr_gib, cap_gib=cap_gib)
+        # the reshard monitor must be able to read what we read: probe the resharding metadata route before anything depends on it
+        detect = _control().get("detect") or params.get("detect-mode", "state")
+        rs0 = await _resharding_state(req, split_idx, "state")
+        ev("reshard_probe", mode_requested=detect, state_route_readable=rs0 is not None, resharding_now=rs0)
+        if rs0 is None and detect == "state":
+            attention("resharding_metadata_unreadable_stop_and_ask", hint="set detect to shards-stable in ~/m2s1-control.json only after asking: it is not a safe proxy")
+            for _ in range(240):  # up to 2 h: wait for the control file, do not guess
+                await asyncio.sleep(30)
+                if _control().get("detect"):
+                    detect = _control()["detect"]
+                    break
+            else:
+                invalid("resharding_metadata_unreadable")
+        await apply_arm_settings()
+        await req("PUT", "/_cluster/settings", body={"persistent": {"indices.auto_reshard.shard_size_threshold": "%dgb" % thr_gib}}, retry=True)
+        state = await cluster_settings()
+        ev("threshold_set", gib=thr_gib, state=state)
+        if str(state.get("indices.auto_reshard.shard_size_threshold", "")).lower() not in ("%dgb" % thr_gib, "%dgb" % thr_gib):
+            invalid("threshold_not_in_effect", state=state)
+        thr = thr_gib * GIB
+        base_cluster = {k: v for k, v in state.items() if k.startswith("indices.auto_reshard")}
+
+        async def seed_counts():
+            r = await req("GET", "/%s/_settings" % ",".join(seeds), params_={"filter_path": "*.settings.index.number_of_shards"}, retry=True)
+            return {k: int(v["settings"]["index"]["number_of_shards"]) for k, v in r.items()}
+
+        seeds_at_start = await seed_counts()
+        ev("seed_shard_counts", counts=seeds_at_start, when="start")
+
+        feeder = _Feeder(req, ev, split_idx, corpus, batch=int(params.get("feed-batch", 5000)), concurrency=int(params.get("feed-concurrency", 8)))
+        feeder.start()
+
+        async def sizes_event(label, u=None):
+            u = u or await _index_usage(req, split_idx)
+            ev(
+                "split_sizes",
+                label=label,
+                n_shards=u["n_shards"],
+                total_gib=round(u["total"] / GIB, 3),
+                avg_gib=round(u["avg"] / GIB, 3),
+                deletes_pct=u["deletes_pct"],
+                per_shard={str(k): [v["bytes"], v["docs"], v["deleted"]] for k, v in sorted(u["shards"].items())},
+            )
+            return u
+
+        async def feed_until(pred, label, limit_s):
+            t_stop = time.time() + limit_s
+            while time.time() < t_stop and time.time() < t_end:
+                u = await _index_usage(req, split_idx)
+                if pred(u):
+                    await feeder.pause(label)
+                    return await sizes_event(label + "_reached")
+                if _control().get("feed_pause"):
+                    await feeder.pause("control")
+                else:
+                    await feeder.resume(label)
+                await asyncio.sleep(20)
+            await feeder.pause(label + "_timeout")
+            attention("feed_timeout", label=label)
+            return await _index_usage(req, split_idx)
+
+        async def put_snapshot(name):
+            await req("POST", "/%s/_flush" % split_idx, retry=True)
+            await asyncio.sleep(settle_s)  # the tracker evaluates every 30 s: at least a few fresh per-shard lines before the snapshot starts
+            u = await sizes_event("before_" + name)
+            ev(
+                "snapshot_context",
+                snapshot=name,
+                store_total_bytes=u["total"],
+                n_shards=u["n_shards"],
+                per_shard_bytes={str(k): v["bytes"] for k, v in sorted(u["shards"].items())},
+                resharding=await _resharding_state(req, split_idx, detect),
+            )
+            await write_shard_map(name)
+            await req("PUT", "/_snapshot/%s/%s" % (repo, name), body={"indices": split_idx, "include_global_state": False})
+            s0, _ = await wait_snapshot(name)
+            names.append(name)
+            if s0.get("state") != "SUCCESS":
+                attention("snapshot_not_success", snapshot=name, state=s0.get("state"), failures=len(s0.get("failures") or []))
+            return s0
+
+        # snapshot 0: the source shard's repository history, taken below the threshold (no split can be running)
+        u = await feed_until(lambda u: u["total"] >= float(params.get("pre-split-fraction", 0.8)) * thr, "pre_split", float(params.get("feed-limit-seconds", 7200)))
+        await put_snapshot("split-s0")
+
+        async def one_split(k, shards_before):
+            """feed until the average per shard is above T, stop writing, wait for the split to start and to finish, settle, snapshot."""
+            over = float(params.get("overshoot-fraction", 1.005))
+            t_cross = None
+            expunged = False
+            t_phase = time.time()
+            while time.time() < t_end:
+                u = await _index_usage(req, split_idx)
+                rs = await _resharding_state(req, split_idx, detect)
+                if rs or u["n_shards"] > shards_before:
+                    break
+                ctl = _control()
+                if u["avg"] >= over * thr:
+                    await feeder.pause("avg_over_threshold")
+                    if t_cross is None:
+                        t_cross = time.time()
+                        await sizes_event("crossed_%d" % k, u)
+                    waited = time.time() - t_cross
+                    if waited > trigger_timeout and every("not_triggered_%d" % k, 600):
+                        cs = await cluster_settings()
+                        attention("split_not_triggered", k=k, waited_s=round(waited), avg_gib=round(u["avg"] / GIB, 2), deletes_pct=u["deletes_pct"], settings=cs)
+                elif ctl.get("feed_pause"):
+                    await feeder.pause("control")
+                else:
+                    t_cross = None
+                    await feeder.resume("below_threshold_%d" % k)
+                # deletes of the previous split not merged away: the monitor skips the index while deletes >= 20%. Ask for them to be expunged once, after a wait
+                if shards_before > 1 and not expunged and u["deletes_pct"] >= 18 and (time.time() - t_phase > float(params.get("expunge-wait-seconds", 1800)) or ctl.get("expunge")):
+                    expunged = True
+                    ev("expunge_deletes", deletes_pct=u["deletes_pct"], response=await req("POST", "/%s/_forcemerge" % split_idx, params_={"only_expunge_deletes": "true", "wait_for_completion": "false"}))
+                if every("wait_%d" % k, 60):
+                    await sizes_event("wait_%d" % k, u)
+                await asyncio.sleep(20)
+            else:
+                invalid("split_not_started", k=k)
+            await feeder.pause("split_started")
+            t_start = time.time()
+            ev("split_started", k=k, n_shards=u["n_shards"], avg_gib=round(u["avg"] / GIB, 3), crossed_for_s=round(t_start - t_cross) if t_cross else None, resharding=rs)
+            await sizes_event("split_%d_started" % k)
+            done_deadline = t_start + float(params.get("split-done-timeout-seconds", 3600))
+            stable_since = None
+            while time.time() < done_deadline:
+                rs = await _resharding_state(req, split_idx, detect)
+                u = await _index_usage(req, split_idx)
+                if detect == "state":
+                    if rs is False and u["n_shards"] == shards_before * 2:
+                        break
+                else:  # shards-stable (not a safe proxy; used only when the control file says so): shard count reached and nothing changed for 10 min
+                    if u["n_shards"] == shards_before * 2:
+                        stable_since = stable_since or time.time()
+                        if time.time() - stable_since > 600:
+                            break
+                if every("splitting_%d" % k, 60):
+                    await sizes_event("splitting_%d" % k, u)
+                await asyncio.sleep(10)
+            else:
+                invalid("split_not_finished", k=k)
+            ev("split_done", k=k, duration_s=round(time.time() - t_start, 1), n_shards=u["n_shards"], detect=detect)
+            sc = await seed_counts()
+            if sc != seeds_at_start:
+                attention("seed_index_split", before=seeds_at_start, now=sc)
+            await sizes_event("split_%d_done" % k, u)
+            # sizes every minute during the settle (deletes and merges), then the snapshot
+            t_settle = time.time() + settle_s
+            while time.time() < t_settle:
+                await sizes_event("settle_%d" % k)
+                await asyncio.sleep(min(60, max(0.0, t_settle - time.time())))
+            return await put_snapshot("split-s%d" % k)
+
+        await one_split(1, 1)
+        await one_split(2, 2)
+        await feeder.stop()
+        await req("PUT", "/_cluster/settings", body={"persistent": {"indices.auto_reshard.shard_size_threshold": params.get("threshold-reset", "1000gb")}}, retry=True)
+        ev("threshold_reset", state=await cluster_settings(), was=base_cluster)
+        ev("seed_shard_counts", counts=await seed_counts(), when="end", unchanged=(await seed_counts()) == seeds_at_start)
+        ev("phase_b_done", snapshots=names, catchup=None, threshold_gib=thr_gib, feeder_docs=feeder.docs, feeder_rejections=feeder.rejections)
+
     ev("end", mode=mode)
     return {"weight": 1, "unit": "ops", "success": True}
 
