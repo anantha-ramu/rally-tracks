@@ -940,7 +940,8 @@ async def _backlog_qa(es, params):
         }
 
     async def primaries():
-        r = await req("GET", "/_cat/shards", qp={"format": "json", "h": "index,shard,prirep,state,node", "expand_wildcards": "all"})
+        # _cat/shards takes no expand_wildcards (HTTP 400), and lists hidden and system indices anyway
+        r = await req("GET", "/_cat/shards", qp={"format": "json", "h": "index,shard,prirep,state,node"})
         started, other = {}, 0
         for s in r:
             if s["prirep"] == "p":
