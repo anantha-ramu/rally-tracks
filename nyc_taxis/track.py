@@ -856,6 +856,406 @@ async def _qos_baseline(es, params):
     return {"weight": 1, "unit": "ops", "success": True}
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# backlog-qa: QA of the snapshot backlog tracker (elastic/elasticsearch-team#5513, PR 4). Not for merge.
+# The runner drives the cluster and logs events (a log line and ~/backlog-qa-events.jsonl). The figures themselves are
+# read afterwards from APM, using the event timestamps. See ~/snapshot-scaling-research/m5513-pr4-qa-plan.md.
+# Control file ~/backlog-qa-control.json: {"go": true} lets the run past gate 1, {"go": false} ends it (setting off).
+# ---------------------------------------------------------------------------------------------------------------------
+BQ_SETTING = "stateless.snapshot.backlog.enabled"
+BQ_EVENTS = os.path.expanduser("~/backlog-qa-events.jsonl")
+BQ_CONTROL = os.path.expanduser("~/backlog-qa-control.json")
+BQ_SNAPSHOT_BODY = {"indices": "*", "expand_wildcards": "all", "include_global_state": True}
+
+
+async def backlog_qa_async(es, params):
+    import logging
+
+    try:
+        return await _backlog_qa(es, params)
+    except BaseException as e:
+        logging.getLogger(__name__).exception("backlog-qa {'event': 'runner_failed', 'error': %r}", repr(e)[:300])
+        raise
+
+
+async def _backlog_qa(es, params):
+    import logging
+    import random
+
+    log = logging.getLogger(__name__)
+    settle_s = float(params.get("settle-seconds", 150))
+    tail_s = float(params.get("tail-seconds", 120))
+    doc_kb = int(params.get("doc-kb", 1))
+    acc_mb = int(params.get("acc-mb", 50))
+    sizes = [int(x) for x in params.get("shard-steps", [350, 1400])]
+    idle_s = float(params.get("idle-seconds", 2400))
+    hard_stop = time.time() + float(params.get("max-seconds", 28800))
+    state = {"nodes_at": 0}
+
+    def ev(_event, /, **kw):
+        kw.update(event=_event, t=int(time.time() * 1000), ts=time.strftime("%H:%M:%S", time.gmtime()))
+        log.info("backlog-qa %s", kw)
+        try:
+            with open(BQ_EVENTS, "a") as f:
+                f.write(json.dumps(kw, default=str) + "\n")
+        except Exception:
+            pass
+
+    async def req(method, path, body=None, qp=None):
+        return _body(await es.perform_request(method=method, path=path, params=qp or {}, body=body))
+
+    def doc():
+        return json.dumps({"n": random.randint(0, 1 << 30), "p": os.urandom(doc_kb * 512).hex()})
+
+    async def bulk(index, n_docs):
+        lines = []
+        for _ in range(n_docs):
+            lines.append('{"index":{}}')
+            lines.append(doc())
+        r = await req("POST", "/%s/_bulk" % index, body="\n".join(lines) + "\n")
+        if r.get("errors"):
+            ev("bulk_errors", index=index)
+
+    async def write(index, mb):
+        per = max(1, int(1024 / doc_kb))  # about 1 MB
+        for _ in range(mb):
+            await bulk(index, per)
+        await req("POST", "/%s/_refresh" % index)
+
+    async def create(index):
+        await req("PUT", "/" + index, body={"settings": {"index.number_of_shards": 1}})
+
+    async def heap():
+        r = await req(
+            "GET",
+            "/_nodes/stats/jvm",
+            qp={"filter_path": "nodes.*.name,nodes.*.roles,nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.mem.heap_max_in_bytes"},
+        )
+        return {
+            n.get("name", i): {"roles": n.get("roles"), "used": n["jvm"]["mem"]["heap_used_in_bytes"], "max": n["jvm"]["mem"]["heap_max_in_bytes"]}
+            for i, n in r.get("nodes", {}).items()
+        }
+
+    async def primaries():
+        r = await req("GET", "/_cat/shards", qp={"format": "json", "h": "index,shard,prirep,state,node", "expand_wildcards": "all"})
+        started, other = {}, 0
+        for s in r:
+            if s["prirep"] == "p":
+                if s["state"] == "STARTED":
+                    started[s["node"]] = started.get(s["node"], 0) + 1
+                else:
+                    other += 1
+        return {"started_primaries_by_node": started, "primaries_not_started": other}
+
+    async def nodes():
+        r = await req("GET", "/_cat/nodes", qp={"format": "json", "h": "name,id,node.role,master,heap.max,ip"})
+        m = await req("GET", "/_cat/master", qp={"format": "json"})
+        return {"nodes": r, "master": m}
+
+    async def sample(tag):
+        try:
+            ev("sample", tag=tag, heap=await heap(), **await primaries())
+            if time.time() - state["nodes_at"] > 600:
+                ev("nodes", **await nodes())
+                state["nodes_at"] = time.time()
+        except Exception as e:
+            ev("sample_error", tag=tag, error=repr(e)[:200])
+
+    async def nap(seconds, tag):
+        end_ = time.time() + seconds
+        while time.time() < end_:
+            await sample(tag)
+            await asyncio.sleep(min(60, max(0.0, end_ - time.time())))
+
+    async def set_enabled(value):
+        await req("PUT", "/_cluster/settings", body={"persistent": {BQ_SETTING: value}})
+        back = await req("GET", "/_cluster/settings", qp={"flat_settings": "true", "filter_path": "persistent"})
+        ev("setting", value=value, read_back=back)
+
+    async def synced(pattern, timeout=240):
+        end_ = time.time() + timeout
+        while time.time() < end_:
+            r = await req(
+                "GET",
+                "/%s/_stats" % pattern,
+                qp={"level": "shards", "filter_path": "indices.*.shards.*.seq_no,indices.*.shards.*.routing.primary"},
+            )
+            bad = 0
+            for idx in r.get("indices", {}).values():
+                for copies in idx["shards"].values():
+                    for c in copies:
+                        if c["routing"]["primary"] and c["seq_no"]["global_checkpoint"] != c["seq_no"]["max_seq_no"]:
+                            bad += 1
+            if bad == 0:
+                return True
+            await asyncio.sleep(10)
+        ev("checkpoints_not_synced", pattern=pattern)
+        return False
+
+    async def merges_idle(pattern, timeout=300):
+        end_ = time.time() + timeout
+        while time.time() < end_:
+            r = await req("GET", "/%s/_stats/merge" % pattern, qp={"filter_path": "_all.primaries.merges.current"})
+            if r.get("_all", {}).get("primaries", {}).get("merges", {}).get("current", 0) == 0:
+                return True
+            await asyncio.sleep(10)
+        ev("merges_not_idle", pattern=pattern)
+        return False
+
+    async def quiet(pattern="qa-*"):
+        await req("POST", "/%s/_flush" % pattern)
+        ok1 = await synced(pattern)
+        ok2 = await merges_idle(pattern)
+        await nap(settle_s, "settle")
+        return ok1 and ok2
+
+    async def snapshot(repo, name, writer=None):
+        t0 = int(time.time() * 1000)
+        try:
+            await req("PUT", "/_snapshot/%s/%s" % (repo, name), body=BQ_SNAPSHOT_BODY, qp={"wait_for_completion": "false"})
+        except Exception as e:
+            ev("snapshot_start_failed", repo=repo, name=name, error=repr(e)[:300])
+            raise
+        ev("snapshot_started", repo=repo, name=name)
+        task = asyncio.ensure_future(writer()) if writer else None
+        info = {}
+        while True:
+            r = await req("GET", "/_snapshot/%s/%s" % (repo, name))
+            info = r.get("snapshots", [{}])[0]
+            if info.get("state") in ("SUCCESS", "PARTIAL", "FAILED"):
+                break
+            await asyncio.sleep(5)
+        if task:
+            task.cancel()
+        st = await req("GET", "/_snapshot/%s/%s/_status" % (repo, name))
+        s0 = st.get("snapshots", [{}])[0]
+        shards = []
+        for iname, idx in s0.get("indices", {}).items():
+            for sid, sh in idx.get("shards", {}).items():
+                inc = sh.get("stats", {}).get("incremental", {})
+                if inc.get("size_in_bytes", 0) > 0:
+                    shards.append([iname, sid, inc.get("size_in_bytes"), inc.get("file_count")])
+        ev(
+            "snapshot_done",
+            repo=repo,
+            name=name,
+            t_request=t0,
+            state=info.get("state"),
+            start=info.get("start_time_in_millis"),
+            end=info.get("end_time_in_millis"),
+            shards=info.get("shards"),
+            incremental_bytes=s0.get("stats", {}).get("incremental", {}).get("size_in_bytes"),
+            incremental_files=s0.get("stats", {}).get("incremental", {}).get("file_count"),
+            total_bytes=s0.get("stats", {}).get("total", {}).get("size_in_bytes"),
+            changed_shards=shards[:200],
+            changed_shard_count=len(shards),
+        )
+        return info
+
+    async def cycle(name, repo, write_fn=None, writer=None):
+        ev("cycle_start", cycle=name, repo=repo)
+        if write_fn:
+            await write_fn()
+        ok = await quiet()
+        ev("sample_point", cycle=name, repo=repo, quiet=ok)
+        await snapshot(repo, "%s-%d" % (name, int(time.time())), writer=writer)
+        ev("cycle_done", cycle=name, repo=repo)
+        await nap(tail_s, "tail")
+        if time.time() > hard_stop:
+            raise RuntimeError("hard stop reached")
+
+    async def finish():
+        try:
+            await set_enabled(None)
+        except Exception as e:
+            ev("finish_setting_failed", error=repr(e)[:200])
+        try:
+            await req("POST", "/_slm/start")
+        except Exception:
+            pass
+        ev("end")
+        return {"weight": 1, "unit": "ops", "success": True}
+
+    # ---- Phase 0: setup, with the setting off ----
+    ev("start", params=params)
+    ev("version", info=await req("GET", "/", qp={"filter_path": "version.build_hash,version.number"}), **await nodes())
+    ev("cluster_settings", settings=await req("GET", "/_cluster/settings", qp={"flat_settings": "true"}))
+    try:
+        ev("slm_stop", response=await req("POST", "/_slm/stop"))
+    except Exception as e:
+        ev("slm_stop_failed", error=repr(e)[:300])
+    b = (await req("GET", "/_snapshot/backup"))["backup"]
+    for rn in ("qa-a", "qa-b"):
+        st = dict(b.get("settings", {}))
+        st["base_path"] = (st.get("base_path", "") + "-" + rn).lstrip("-")
+        await req("PUT", "/_snapshot/" + rn, body={"type": b["type"], "settings": st})
+        await req(
+            "PUT",
+            "/_slm/policy/policy-" + rn,
+            body={"schedule": "0 0 0 1 1 ? 2099", "name": "<%s-{now/d}>" % rn, "repository": rn, "config": {"indices": ["*"]}},
+        )
+        ev("repository_and_policy", repo=rn, type=b["type"], keys=sorted(st.keys()))
+    ev("slm_policies", policies=await req("GET", "/_slm/policy", qp={"filter_path": "*.policy.repository,*.next_execution_millis"}))
+
+    # Which indices change on their own (Kibana task manager and the like)?
+    idx_list = await req("GET", "/_cat/indices", qp={"format": "json", "expand_wildcards": "all", "h": "index,pri,docs.count,store.size"})
+    ev("indices_at_start", indices=idx_list)
+    s_a = await req("GET", "/_all/_stats/indexing,store", qp={"expand_wildcards": "all", "filter_path": "indices.*.primaries.indexing.index_total,indices.*.primaries.store.size_in_bytes"})
+    await asyncio.sleep(150)
+    s_b = await req("GET", "/_all/_stats/indexing,store", qp={"expand_wildcards": "all", "filter_path": "indices.*.primaries.indexing.index_total,indices.*.primaries.store.size_in_bytes"})
+    changing = [
+        i
+        for i, v in s_b.get("indices", {}).items()
+        if v["primaries"]["indexing"]["index_total"] != s_a.get("indices", {}).get(i, {}).get("primaries", {}).get("indexing", {}).get("index_total")
+    ]
+    ev("self_changing_indices", indices=changing)
+
+    ev("baseline_heap_start")
+    await nap(600, "baseline_off")
+    await set_enabled(True)
+    await nap(120, "just_enabled")
+
+    # ---- Phase A ----
+    async def make_acc():
+        for i in range(1, 7):
+            await create("qa-acc-%d" % i)
+        for i in range(1, 7):
+            await write("qa-acc-%d" % i, acc_mb)
+
+    await cycle("c01-first", "qa-a", write_fn=make_acc)
+    ev("gate1_ready")
+    end_ = time.time() + 3 * 3600
+    go = None
+    while time.time() < end_ and go is None:
+        try:
+            with open(BQ_CONTROL) as f:
+                go = json.load(f).get("go")
+        except Exception:
+            await asyncio.sleep(20)
+    ev("gate1_released", go=go)
+    if go is not True:
+        return await finish()
+
+    async def w(idxs, mb=acc_mb):
+        for i in idxs:
+            await write("qa-acc-%d" % i, mb)
+
+    async def del_upd():
+        await req("POST", "/qa-acc-5/_delete_by_query", body={"query": {"range": {"n": {"lt": (1 << 30) // 10}}}}, qp={"refresh": "true", "conflicts": "proceed"})
+        await req(
+            "POST",
+            "/qa-acc-5/_update_by_query",
+            body={"script": {"source": "ctx._source.u = 1"}, "query": {"range": {"n": {"gte": (1 << 30) // 10, "lt": (1 << 30) // 5}}}},
+            qp={"refresh": "true", "conflicts": "proceed"},
+        )
+
+    async def many_segments():
+        for _ in range(20):
+            await bulk("qa-acc-6", 512)
+            await req("POST", "/qa-acc-6/_refresh")
+
+    async def merge_by_policy():
+        try:
+            await req("PUT", "/qa-acc-6/_settings", body={"index.merge.policy.segments_per_tier": 2})
+        except Exception as e:
+            ev("segments_per_tier_failed", error=repr(e)[:200])
+        await req("POST", "/qa-acc-6/_forcemerge")  # no max_num_segments, so the state id stays
+        await merges_idle("qa-acc-6")
+
+    async def overlap_writer():
+        while True:
+            await bulk("qa-acc-2", 1024)
+            await asyncio.sleep(2)
+
+    await cycle("c02-ctl", "qa-a")
+    await cycle("c03-write1", "qa-a", write_fn=lambda: w([1]))
+    await cycle("c04-ctl", "qa-a")
+    await cycle("c05-write3", "qa-a", write_fn=lambda: w([2, 3, 4]))
+    await cycle("c06-ctl", "qa-a")
+    await cycle("c07-delete-update", "qa-a", write_fn=del_upd)
+    await cycle("c08-ctl", "qa-a")
+    await cycle("c09-segments", "qa-a", write_fn=many_segments)
+    await cycle("c09b-merge", "qa-a", write_fn=merge_by_policy)
+    await cycle("c10-b-first", "qa-b")
+    await cycle("c11-two-a", "qa-a", write_fn=lambda: w([1]))
+    await cycle("c12-two-b", "qa-b")
+    # delete the oldest snapshot of qa-a
+    listing = await req("GET", "/_snapshot/qa-a/_all", qp={"filter_path": "snapshots.snapshot,snapshots.start_time_in_millis"})
+    oldest = sorted(listing.get("snapshots", []), key=lambda s: s["start_time_in_millis"])[0]["snapshot"]
+    ev("delete_started", repo="qa-a", name=oldest)
+    await req("DELETE", "/_snapshot/qa-a/" + oldest)
+    ev("delete_done", repo="qa-a", name=oldest)
+    await nap(tail_s, "tail")
+    await cycle("c13-after-delete", "qa-a")
+    await cycle("c14-overlap", "qa-a", writer=overlap_writer)
+    await cycle("c15-after-overlap", "qa-a")
+    cur = await nodes()
+    index_nodes = [n for n in cur["nodes"] if "I" in n.get("node.role", "")]
+    if len(index_nodes) >= 2:
+        try:
+            p = await req("GET", "/_cat/shards/qa-acc-3", qp={"format": "json", "h": "index,shard,prirep,node,state"})
+            src = [s for s in p if s["prirep"] == "p"][0]["node"]
+            dst = [n["name"] for n in index_nodes if n["name"] != src][0]
+            ev("reroute", frm=src, to=dst, response=await req("POST", "/_cluster/reroute", body={"commands": [{"move": {"index": "qa-acc-3", "shard": 0, "from_node": src, "to_node": dst}}]}))
+            await nap(settle_s, "after_reroute")
+            await cycle("c16-after-relocation", "qa-a")
+        except Exception as e:
+            ev("reroute_skipped", error=repr(e)[:300])
+    else:
+        ev("reroute_skipped", error="one index node")
+
+    # ---- Phase B ----
+    have = 0
+
+    async def make_small(i):
+        name = "qa-s-%d" % i
+        await create(name)
+        for _ in range(5):
+            await bulk(name, 200)
+        await req("POST", "/%s/_refresh" % name)
+
+    for target in sizes:
+        ev("phase_b_step", target=target)
+        sem = asyncio.Semaphore(8)
+
+        async def one(i):
+            async with sem:
+                await make_small(i)
+
+        await asyncio.gather(*[one(i) for i in range(have, target)])
+        have = target
+        await req("GET", "/_cluster/health/qa-s-*", qp={"wait_for_status": "green", "timeout": "20m", "wait_for_no_relocating_shards": "true"})
+        ev("b_created", target=target, **await nodes())
+        await cycle("b%d-snap" % target, "qa-a")
+        listing = await req("GET", "/_snapshot/qa-a/_all", qp={"filter_path": "snapshots.snapshot,snapshots.start_time_in_millis"})
+        snaps = sorted(listing.get("snapshots", []), key=lambda s: s["start_time_in_millis"])
+        victim = snaps[0]["snapshot"]
+        ev("delete_started", repo="qa-a", name=victim, step=target)
+        await req("DELETE", "/_snapshot/qa-a/" + victim)
+        ev("delete_done", repo="qa-a", name=victim, step=target)
+        await nap(settle_s, "after_delete")
+        ev("toggle_off", step=target)
+        await set_enabled(False)
+        await nap(120, "toggled_off")
+        await set_enabled(True)
+        ev("toggle_on", step=target)
+        await nap(300, "toggled_on")
+        if time.time() > hard_stop:
+            return await finish()
+
+    ev("idle_start")
+    await nap(idle_s, "idle")
+
+    # ---- Off switch ----
+    ev("off_start")
+    await set_enabled(None)
+    await nap(240, "off")
+    await set_enabled(True)
+    ev("on_again")
+    await nap(300, "on_again")
+    return await finish()
+
+
 def register(registry):
     async_runner = registry.meta_data.get("async_runner", False)
     if async_runner:
@@ -863,5 +1263,6 @@ def register(registry):
         registry.register_runner("snapshot-scaling-controller", snapshot_scaling_controller_async, async_runner=True)
         registry.register_runner("snapshot-oracle", snapshot_oracle_async, async_runner=True)
         registry.register_runner("qos-baseline", qos_baseline_async, async_runner=True)
+        registry.register_runner("backlog-qa", backlog_qa_async, async_runner=True)
     else:
         registry.register_runner("wait-for-ml-lookback", wait_for_ml_lookback)

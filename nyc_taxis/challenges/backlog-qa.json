@@ -1,0 +1,18 @@
+    {
+      "name": "backlog-qa",
+      "description": "QA of the snapshot backlog tracker (elastic/elasticsearch-team#5513, PR 4). Not for merge. One runner does everything; see track.py.",
+      "schedule": [
+        {
+          "name": "backlog-qa",
+          "operation": {
+            "operation-type": "backlog-qa",
+            "settle-seconds": {{ backlog_settle_seconds | default(150) }},
+            "tail-seconds": {{ backlog_tail_seconds | default(120) }},
+            "acc-mb": {{ backlog_acc_mb | default(50) }},
+            "shard-steps": {{ backlog_shard_steps | default([350, 1400]) | tojson }},
+            "idle-seconds": {{ backlog_idle_seconds | default(2400) }},
+            "max-seconds": {{ backlog_max_seconds | default(28800) }}
+          }
+        }
+      ]
+    }
