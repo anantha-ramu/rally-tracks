@@ -889,6 +889,9 @@ async def _backlog_qa(es, params):
     acc_mb = int(params.get("acc-mb", 50))
     sizes = [int(x) for x in params.get("shard-steps", [350, 1400])]
     idle_s = float(params.get("idle-seconds", 2400))
+    # PRs 5 and 6: a throttled repository whose snapshots run long enough for the master metrics to show the hold
+    slow_rate = str(params.get("slow-rate", "2mb"))
+    hold_mb = int(params.get("hold-mb", 100))
     hard_stop = time.time() + float(params.get("max-seconds", 28800))
     state = {"nodes_at": 0}
 
@@ -952,11 +955,25 @@ async def _backlog_qa(es, params):
         m = await req("GET", "/_cat/master", qp={"format": "json"})
         return {"nodes": r, "master": m}
 
+    async def transport_actions():
+        # per node, the requests each snapshot backlog action received: count and total size (the report size, PR 5)
+        r = await req("GET", "/_nodes/stats/transport", qp={"filter_path": "nodes.*.name,nodes.*.transport.actions"})
+        out = {}
+        for nid, n in r.get("nodes", {}).items():
+            acts = n.get("transport", {}).get("actions", {})
+            out[n.get("name", nid)] = {
+                a: {"requests": v.get("requests", {}).get("count"), "request_bytes": v.get("requests", {}).get("total_size_in_bytes")}
+                for a, v in acts.items()
+                if "snapshot/publish_backlog" in a or "snapshot/get_shard_generations" in a
+            }
+        return out
+
     async def sample(tag):
         try:
             ev("sample", tag=tag, heap=await heap(), **await primaries())
             if time.time() - state["nodes_at"] > 600:
                 ev("nodes", **await nodes())
+                ev("transport_actions", tag=tag, actions=await transport_actions())
                 state["nodes_at"] = time.time()
         except Exception as e:
             ev("sample_error", tag=tag, error=repr(e)[:200])
@@ -1085,9 +1102,11 @@ async def _backlog_qa(es, params):
     except Exception as e:
         ev("slm_stop_failed", error=repr(e)[:300])
     b = (await req("GET", "/_snapshot/backup"))["backup"]
-    for rn in ("qa-a", "qa-b"):
+    for rn in ("qa-a", "qa-b", "qa-slow"):
         st = dict(b.get("settings", {}))
         st["base_path"] = (st.get("base_path", "") + "-" + rn).lstrip("-")
+        if rn == "qa-slow":
+            st["max_snapshot_bytes_per_sec"] = slow_rate
         await req("PUT", "/_snapshot/" + rn, body={"type": b["type"], "settings": st})
         await req(
             "PUT",
@@ -1189,6 +1208,49 @@ async def _backlog_qa(es, params):
     await cycle("c13-after-delete", "qa-a")
     await cycle("c14-overlap", "qa-a", writer=overlap_writer)
     await cycle("c15-after-overlap", "qa-a")
+
+    # ---- PRs 5 and 6: the hold on the master, with snapshots of qa-slow that run for minutes ----
+    async def move_one(index):
+        cur_ = await nodes()
+        idx_nodes = [n for n in cur_["nodes"] if "I" in n.get("node.role", "")]
+        if len(idx_nodes) < 2:
+            ev("hold_move_skipped", error="one index node")
+            return
+        try:
+            p_ = await req("GET", "/_cat/shards/" + index, qp={"format": "json", "h": "index,shard,prirep,node,state"})
+            src_ = [x for x in p_ if x["prirep"] == "p"][0]["node"]
+            dst_ = [n["name"] for n in idx_nodes if n["name"] != src_][0]
+            ev("hold_move", index=index, frm=src_, to=dst_, response=await req(
+                "POST", "/_cluster/reroute", body={"commands": [{"move": {"index": index, "shard": 0, "from_node": src_, "to_node": dst_}}]}))
+        except Exception as e:
+            ev("hold_move_skipped", error=repr(e)[:300])
+
+    async def hold_cycle(name, write_idxs=(), second=False, move=False):
+        ev("cycle_start", cycle=name, repo="qa-slow")
+        if write_idxs:
+            await w(list(write_idxs), hold_mb)
+        ok = await quiet()
+        ev("sample_point", cycle=name, repo="qa-slow", quiet=ok)
+        tag_ = int(time.time())
+        first_ = asyncio.ensure_future(snapshot("qa-slow", "%s-a-%d" % (name, tag_), writer=overlap_writer))
+        later = []
+        if second:
+            await asyncio.sleep(5)
+            later.append(asyncio.ensure_future(snapshot("qa-slow", "%s-b-%d" % (name, tag_))))
+        if move:
+            await asyncio.sleep(90)
+            await move_one("qa-acc-3")
+        await first_
+        for t_ in later:
+            await t_
+        ev("cycle_done", cycle=name, repo="qa-slow")
+        await nap(tail_s, "tail")
+
+    # first snapshot of qa-slow: everything uploads, slowly; a writer runs and one primary moves during it
+    await hold_cycle("h01-hold", move=True)
+    # two snapshots back to back: the second one's shards wait for a figure at the generation the first one writes
+    await hold_cycle("h02-overlap", write_idxs=(2, 4), second=True)
+    await cycle("h03-after-hold", "qa-slow")
     cur = await nodes()
     index_nodes = [n for n in cur["nodes"] if "I" in n.get("node.role", "")]
     if len(index_nodes) >= 2:
